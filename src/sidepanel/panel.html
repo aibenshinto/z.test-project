@@ -1,0 +1,141 @@
+<title>AutoApply</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #14161a; --muted: #5b6472; --line: #e3e6ea;
+    --accent: #2a5bd7; --ok: #17803d; --warn: #b45309; --err: #c0392b;
+    --chip: #f2f4f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #16181c; --fg: #e8eaed; --muted: #9aa3b0; --line: #2c3037;
+      --accent: #7aa2f7; --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+      --chip: #22262c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); font: 13px/1.5 system-ui, sans-serif; padding: 12px; }
+  h1 { font-size: 15px; margin: 0 0 2px; }
+  .sub { color: var(--muted); font-size: 11px; margin-bottom: 12px; }
+  nav { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
+  nav button {
+    background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted);
+    padding: 6px 10px; cursor: pointer; font: inherit;
+  }
+  nav button[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+  section[hidden] { display: none; }
+  label { display: block; font-size: 11px; color: var(--muted); margin: 10px 0 3px; }
+  input, select, textarea {
+    width: 100%; padding: 6px 8px; border: 1px solid var(--line); border-radius: 5px;
+    background: var(--bg); color: var(--fg); font: inherit;
+  }
+  button.act {
+    background: var(--accent); color: #fff; border: 0; border-radius: 5px;
+    padding: 7px 12px; cursor: pointer; font: inherit; margin-top: 10px;
+  }
+  button.act.ghost { background: var(--chip); color: var(--fg); }
+  button.act.danger { background: var(--err); }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row > * { flex: 1; }
+  .card { border: 1px solid var(--line); border-radius: 6px; padding: 9px; margin-bottom: 7px; }
+  .card b { font-size: 12px; }
+  .meta { color: var(--muted); font-size: 11px; }
+  .pill { display: inline-block; background: var(--chip); border-radius: 10px; padding: 1px 7px; font-size: 10px; }
+  .status { padding: 8px; border-radius: 5px; background: var(--chip); font-size: 11px; margin-bottom: 10px; }
+  .status.halted { background: color-mix(in srgb, var(--err) 15%, transparent); color: var(--err); }
+  .muted { color: var(--muted); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  #log { max-height: 180px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 10px; }
+</style>
+
+<h1>AutoApply</h1>
+<div class="sub">Resume-driven job search and application</div>
+
+<div id="status" class="status">Loading…</div>
+
+<nav>
+  <button data-tab="setup" aria-selected="true">Setup</button>
+  <button data-tab="profile" aria-selected="false">Profile</button>
+  <button data-tab="jobs" aria-selected="false">Jobs</button>
+  <button data-tab="answers" aria-selected="false">Answers</button>
+  <button data-tab="run" aria-selected="false">Run</button>
+</nav>
+
+<section id="tab-setup">
+  <label>Provider</label>
+  <select id="provider">
+    <option value="gemini">Gemini</option>
+    <option value="claude">Claude</option>
+    <option value="openai">OpenAI</option>
+  </select>
+
+  <label>API key <span class="muted" id="keyHint"></span></label>
+  <input id="apiKey" type="password" placeholder="paste key" autocomplete="off">
+
+  <label>Model</label>
+  <input id="model" placeholder="gemini-2.0-flash">
+
+  <button class="act" id="saveKey">Save provider</button>
+
+  <label style="margin-top:18px">Resume (PDF)</label>
+  <input id="resumeFile" type="file" accept="application/pdf,.pdf,.doc,.docx">
+  <div class="row">
+    <button class="act" id="uploadResume">Upload</button>
+    <button class="act ghost" id="parseResume">Parse into profile</button>
+  </div>
+  <div id="profileOut" class="meta" style="margin-top:8px"></div>
+</section>
+
+<section id="tab-profile" hidden>
+  <div class="meta">Enter your profile directly if your resume does not document
+  your experience. These values fill every application field.</div>
+  <label>Full name</label><input id="pName">
+  <label>Current title</label><input id="pTitle">
+  <label>Headline (50+ characters — Naukri rejects shorter)</label>
+  <textarea id="pHeadline" rows="2"></textarea>
+  <div class="meta" id="pHeadlineLen"></div>
+  <div class="grid2">
+    <div><label>Current location</label><input id="pLocation"></div>
+    <div><label>Total years</label><input id="pYears" type="number" step="0.5"></div>
+  </div>
+  <label>Preferred locations (comma separated)</label><input id="pPreferred">
+  <label>Skills — one per line, <code>name: years</code></label>
+  <textarea id="pSkills" rows="6" placeholder="Python: 2&#10;Django: 2"></textarea>
+  <div class="row"><button class="act" id="saveProfile">Save profile</button><button class="act ghost" id="loadSeed">Load seed</button></div>
+  <div id="profileCheck" class="meta" style="margin-top:8px"></div>
+</section>
+
+<section id="tab-jobs" hidden>
+  <label>Search URL (Naukri results page)</label>
+  <input id="searchUrl" placeholder="https://www.naukri.com/python-jobs-in-bangalore">
+  <div class="row">
+    <button class="act" id="scrape">Scrape into queue</button>
+    <button class="act ghost" id="clearQueue">Clear queue</button>
+  </div>
+  <div id="queueOut" style="margin-top:10px"></div>
+</section>
+
+<section id="tab-answers" hidden>
+  <div class="meta">Cached screening answers. Correct one here and every future application uses it.</div>
+  <div id="bankOut" style="margin-top:8px"></div>
+</section>
+
+<section id="tab-run" hidden>
+  <div class="grid2">
+    <div><label>Max / day</label><input id="maxPerDay" type="number"></div>
+    <div><label>Max / hour</label><input id="maxPerHour" type="number"></div>
+    <div><label>Min delay (s)</label><input id="minDelay" type="number"></div>
+    <div><label>Max delay (s)</label><input id="maxDelay" type="number"></div>
+  </div>
+  <label>Minimum relevance (0–1)</label>
+  <input id="minRelevance" type="number" step="0.05" min="0" max="1">
+  <button class="act ghost" id="saveGov">Save limits</button>
+
+  <div class="row" style="margin-top:14px">
+    <button class="act" id="start">Start auto-apply</button>
+    <button class="act danger" id="stop">Stop</button>
+  </div>
+  <button class="act ghost" id="clearHalt">Clear halt</button>
+  <div id="log" class="meta" style="margin-top:10px"></div>
+</section>
+
+<script type="module" src="panel.js"></script>

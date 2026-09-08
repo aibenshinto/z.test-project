@@ -1,0 +1,56 @@
+{
+  "manifest_version": 3,
+  "name": "AutoApply",
+  "version": "0.1.0",
+  "description": "Resume-driven job search and application assistant for Naukri, LinkedIn and Indeed.",
+  "permissions": [
+    "storage",
+    "alarms",
+    "scripting",
+    "tabs",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://*.naukri.com/*",
+    "https://*.linkedin.com/*",
+    "https://*.indeed.com/*",
+    "https://api.anthropic.com/*",
+    "https://api.openai.com/*",
+    "https://generativelanguage.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "src/sidepanel/panel.html"
+  },
+  "action": {
+    "default_title": "AutoApply"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.naukri.com/*"
+      ],
+      "js": [
+        "src/content/naukri/selectors.js",
+        "src/content/naukri/typing.js",
+        "src/content/naukri/scrape.js",
+        "src/content/naukri/apply.js",
+        "src/content/naukri/main.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "profile.seed.json"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}

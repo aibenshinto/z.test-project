@@ -1,0 +1,31 @@
+{
+  "fullName": "Abhinav Raj",
+  "currentTitle": "Python Developer",
+  "headline": "Python Developer with 2 years building Django applications at Scandle Inc",
+  "location": "Thrissur",
+  "preferredLocations": [
+    "Bangalore",
+    "Bengaluru",
+    "Kochi",
+    "Hyderabad",
+    "Pune",
+    "Remote"
+  ],
+  "totalYears": 2,
+  "skills": [
+    {
+      "name": "Python",
+      "years": 2
+    },
+    {
+      "name": "Django",
+      "years": 2
+    }
+  ],
+  "education": "B.C.A., Christ College Bangalore (expected 2029)",
+  "employer": "Scandle Inc, Thalassery",
+  "_source": "manual",
+  "excludedSkills": [
+    "Flask"
+  ]
+}
