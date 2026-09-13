@@ -38,13 +38,20 @@
   .row > * { flex: 1; }
   .card { border: 1px solid var(--line); border-radius: 6px; padding: 9px; margin-bottom: 7px; }
   .card b { font-size: 12px; }
+  summary { cursor: pointer; list-style: none; }
+  summary::-webkit-details-marker { display: none; }
+  summary::after { content: "+"; float: right; color: var(--muted); }
+  details[open] summary::after { content: "−"; }
+  .detail { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 7px; }
+  .detail ul { margin: 3px 0 7px; padding-left: 18px; }
+  .detail a { color: var(--accent); }
   .meta { color: var(--muted); font-size: 11px; }
   .pill { display: inline-block; background: var(--chip); border-radius: 10px; padding: 1px 7px; font-size: 10px; }
   .status { padding: 8px; border-radius: 5px; background: var(--chip); font-size: 11px; margin-bottom: 10px; }
   .status.halted { background: color-mix(in srgb, var(--err) 15%, transparent); color: var(--err); }
   .muted { color: var(--muted); }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  #log { max-height: 180px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 10px; }
+  #log { max-height: 180px; overflow-y: auto; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 10px; }
 </style>
 
 <h1>AutoApply</h1>
@@ -75,9 +82,10 @@
   <input id="model" placeholder="gemini-2.0-flash">
 
   <button class="act" id="saveKey">Save provider</button>
+  <button class="act danger" id="deleteData">Delete all extension data</button>
 
-  <label style="margin-top:18px">Resume (PDF)</label>
-  <input id="resumeFile" type="file" accept="application/pdf,.pdf,.doc,.docx">
+  <label style="margin-top:18px">Resume (PDF, TXT, or provider-supported DOCX)</label>
+  <input id="resumeFile" type="file" accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx,text/plain,.txt">
   <div class="row">
     <button class="act" id="uploadResume">Upload</button>
     <button class="act ghost" id="parseResume">Parse into profile</button>
@@ -88,6 +96,7 @@
 <section id="tab-profile" hidden>
   <div class="meta">Enter your profile directly if your resume does not document
   your experience. These values fill every application field.</div>
+  <div id="profileGuidance" class="status" hidden></div>
   <label>Full name</label><input id="pName">
   <label>Current title</label><input id="pTitle">
   <label>Headline (50+ characters — Naukri rejects shorter)</label>
@@ -100,12 +109,36 @@
   <label>Preferred locations (comma separated)</label><input id="pPreferred">
   <label>Skills — one per line, <code>name: years</code></label>
   <textarea id="pSkills" rows="6" placeholder="Python: 2&#10;Django: 2"></textarea>
+  <div class="grid2">
+    <div><label>Email</label><input id="pEmail" type="email"></div>
+    <div><label>Phone</label><input id="pPhone" type="tel"></div>
+    <div><label>Notice period (days)</label><input id="pNotice" type="number" min="0"></div>
+    <div><label>Remote preference</label><select id="pRemote"><option value="">Not specified</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="onsite">On-site</option></select></div>
+  </div>
+  <label>Work authorization</label><input id="pWorkAuth" placeholder="Only enter an explicit answer">
+  <label>Visa sponsorship requirement</label><input id="pVisa" placeholder="Only enter an explicit answer">
+  <label>Current salary</label><input id="pCurrentSalary">
+  <label>Salary expectation</label><input id="pSalaryExpectation">
+  <label><input id="pRelocate" type="checkbox" style="width:auto"> Willing to relocate</label>
   <div class="row"><button class="act" id="saveProfile">Save profile</button><button class="act ghost" id="loadSeed">Load seed</button></div>
   <div id="profileCheck" class="meta" style="margin-top:8px"></div>
+  <h2 style="font-size:13px;margin:18px 0 0">Job preferences</h2>
+  <label>Target titles (comma separated)</label><input id="prefTitles" placeholder="Python Developer, Backend Developer">
+  <label>Locations (comma separated)</label><input id="prefLocations" placeholder="Bangalore, Remote">
+  <label><input id="prefAnywhereIndia" type="checkbox" style="width:auto"> Apply anywhere in India</label>
+  <div class="grid2">
+    <div><label>Minimum experience</label><input id="prefExpMin" type="number" min="0" step="0.5"></div>
+    <div><label>Maximum experience</label><input id="prefExpMax" type="number" min="0" step="0.5"></div>
+  </div>
+  <label>Employment types (comma separated)</label><input id="prefEmployment" placeholder="Full-time">
+  <label>Companies to exclude (comma separated)</label><input id="prefExcludeCompanies">
+  <label>Required keywords (comma separated)</label><input id="prefIncludeKeywords">
+  <label>Excluded keywords (comma separated)</label><input id="prefExcludeKeywords">
+  <button class="act ghost" id="savePreferences">Save preferences</button>
 </section>
 
 <section id="tab-jobs" hidden>
-  <label>Search URL (Naukri results page)</label>
+  <label>Search URL (Naukri or LinkedIn results page)</label>
   <input id="searchUrl" placeholder="https://www.naukri.com/python-jobs-in-bangalore">
   <div class="row">
     <button class="act" id="scrape">Scrape into queue</button>
@@ -120,6 +153,17 @@
 </section>
 
 <section id="tab-run" hidden>
+  <div id="currentRun" class="card muted">No active application.</div>
+  <div id="actionRequired" class="card" hidden>
+    <b>Action required</b>
+    <div id="pendingQuestion" style="margin-top:5px"></div>
+    <div id="pendingReason" class="meta" style="margin-top:5px" hidden></div>
+    <label id="pendingAnswerLabel" for="pendingAnswer" style="margin-top:9px">Your answer</label>
+    <textarea id="pendingAnswer" rows="3" style="margin-top:4px" placeholder="Type your answer"></textarea>
+    <div id="answerReuseNote" class="meta" style="margin-top:5px">Saving this answer will reuse it automatically for this question and closely matching questions in future applications.</div>
+    <div id="profilePrompt" class="meta" style="margin-top:7px" hidden></div>
+    <div class="row"><button class="act ghost" id="editProfile" hidden>Complete profile</button><button class="act" id="enableExternal" hidden>Enable company site</button><button class="act" id="continueAnswer">Save &amp; continue</button><button class="act ghost" id="skipJob">Skip application</button></div>
+  </div>
   <div class="grid2">
     <div><label>Max / day</label><input id="maxPerDay" type="number"></div>
     <div><label>Max / hour</label><input id="maxPerHour" type="number"></div>
@@ -132,6 +176,8 @@
 
   <div class="row" style="margin-top:14px">
     <button class="act" id="start">Start auto-apply</button>
+    <button class="act ghost" id="pause">Pause</button>
+    <button class="act ghost" id="resume">Resume</button>
     <button class="act danger" id="stop">Stop</button>
   </div>
   <button class="act ghost" id="clearHalt">Clear halt</button>

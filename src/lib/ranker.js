@@ -71,9 +71,14 @@ export function heuristicScore(job, profile) {
   // --- location ---
   const prefs = (profile.preferredLocations || []).map(norm);
   const loc = norm(job.location);
-  const locHit = prefs.some((p) => p && loc.includes(p)) || /remote/.test(loc);
+  // Job boards often list only an Indian city (for example “Bengaluru”), not
+  // its country. This explicit preference therefore treats India-based search
+  // results as location matches without requiring every city in the profile.
+  const nationwideIndia = Boolean(profile.applyAnywhereInIndia) ||
+    prefs.some((p) => /^(india|anywhere in india|pan india)$/.test(p));
+  const locHit = nationwideIndia || prefs.some((p) => p && loc.includes(p)) || /remote/.test(loc);
   const locScore = prefs.length ? (locHit ? 1 : 0.25) : 0.6;
-  reasons.push(locHit ? "location preferred" : "location not preferred");
+  reasons.push(nationwideIndia ? "location matches anywhere-in-India preference" : (locHit ? "location preferred" : "location not preferred"));
 
   const rec = recencyScore(job.postedOn);
   if (rec < 0.4) reasons.push("stale posting");

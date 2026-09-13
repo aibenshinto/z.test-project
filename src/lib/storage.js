@@ -15,6 +15,22 @@ const DEFAULTS = {
   },
   profile: null,          // structured resume, produced once by parseResume
   resumeText: "",         // raw extracted text, kept for re-parsing
+  preferences: {
+    jobTitles: [],
+    locations: [],
+    applyAnywhereInIndia: false,
+    experienceRange: { min: 0, max: 10 },
+    employmentTypes: ["Full-time"],
+    remotePreference: "hybrid",
+    minimumSalary: null,
+    companiesToExclude: [],
+    keywordsToInclude: [],
+    keywordsToExclude: [],
+  },
+  confidence: {
+    auto: 0.85,           // fill without asking
+    confirm: 0.60,        // show suggested answer, wait for user
+  },
   governor: {
     enabled: false,       // master kill switch - off until you flip it
     maxPerDay: 25,
@@ -49,3 +65,14 @@ export async function get(key, fallback = null) {
 }
 
 export const set = (key, value) => chrome.storage.local.set({ [key]: value });
+
+const USER_KEYS = [
+  "llm", "profile", "resumeText", "resumeFile", "preferences", "answerBank",
+  "queue", "eventLog", "submitLog", "agentSession", "haltedAt", "haltReason",
+  "confidence", "governor", "searches",
+];
+
+/** User-initiated wipe of candidate data, history, keys, and session. */
+export async function deleteAllUserData() {
+  await chrome.storage.local.remove(USER_KEYS);
+}

@@ -1,0 +1,9 @@
+{
+  "name": "autoapply-extension",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node --check src/background/service-worker.js && node --check src/sidepanel/panel.js"
+  }
+}

@@ -18,6 +18,9 @@
     "https://api.openai.com/*",
     "https://generativelanguage.googleapis.com/*"
   ],
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
   "background": {
     "service_worker": "src/background/service-worker.js",
     "type": "module"
@@ -41,16 +44,18 @@
         "src/content/naukri/main.js"
       ],
       "run_at": "document_idle"
-    }
-  ],
-  "web_accessible_resources": [
+    },
     {
-      "resources": [
-        "profile.seed.json"
-      ],
       "matches": [
-        "<all_urls>"
-      ]
+        "https://*.linkedin.com/*"
+      ],
+      "js": [
+        "src/content/linkedin/selectors.js",
+        "src/content/linkedin/scrape.js",
+        "src/content/linkedin/apply.js",
+        "src/content/linkedin/main.js"
+      ],
+      "run_at": "document_idle"
     }
   ]
 }

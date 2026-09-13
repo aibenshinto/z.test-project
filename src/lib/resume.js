@@ -26,7 +26,26 @@ const PROFILE_SCHEMA = {
       },
     },
     education: { type: "string" },
+    email: { type: "string" },
+    phone: { type: "string" },
     noticePeriodDays: { type: "number" },
+    currentSalary: { type: "string" },
+    salaryExpectation: { type: "string" },
+    workAuthorization: { type: "string" },
+    visaSponsorship: { type: "string" },
+    willingToRelocate: { type: "boolean" },
+    remotePreference: { type: "string" },
+    projects: { type: "array", items: { type: "string" } },
+    certifications: { type: "array", items: { type: "string" } },
+    languages: { type: "array", items: { type: "string" } },
+    links: {
+      type: "object",
+      properties: {
+        linkedin: { type: "string" },
+        github: { type: "string" },
+        portfolio: { type: "string" },
+      },
+    },
   },
   required: ["fullName", "headline", "location", "totalYears", "currentTitle", "skills"],
 };
@@ -65,18 +84,27 @@ export async function parseResume() {
   const file = await getResume();
   if (!file) throw new Error("no resume uploaded");
 
+  const isText = /^text\//.test(file.mime) || /\.txt$/i.test(file.name || "");
+  let resumeBody = "";
+  if (isText) {
+    resumeBody = atob(file.b64);
+    await set("resumeText", resumeBody);
+  }
+
   const profile = await askJSON({
     task: "parseResume",
-    file: { mime: file.mime, b64: file.b64 },
+    file: isText ? undefined : { mime: file.mime, b64: file.b64 },
     system:
       "You extract a structured candidate profile from a resume. Record only " +
       "what the resume actually states. Never inflate years of experience and " +
       "never invent a skill that does not appear. If years for a skill are not " +
       "stated, infer them from the employment dates that mention it, and if " +
-      "that is not possible either, use 0.",
-    user:
-      "Extract the candidate profile from the attached resume. The headline " +
-      "must exceed 50 characters and read as a professional summary line.",
+      "that is not possible either, use 0. Leave unknown optional fields empty.",
+    user: isText
+      ? ("Extract the candidate profile from this resume text. The headline " +
+         "must exceed 50 characters.\n\n" + resumeBody.slice(0, 24000))
+      : "Extract the candidate profile from the attached resume. The headline " +
+        "must exceed 50 characters and read as a professional summary line.",
     schema: PROFILE_SCHEMA,
   });
 

@@ -15,6 +15,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         case "APPLY":
           return sendResponse({ ok: true, ...(await naukriApply.apply(msg.job)) });
 
+        case "CONTINUE_APPLY":
+          return sendResponse({ ok: true, ...(await naukriApply.continueApply(msg.job, msg.answer)) });
+
+        case "OPEN_EXTERNAL_COMPANY_SITE":
+          return sendResponse({ ok: true, ...naukriApply.openExternalCompanySite() });
+
         case "PROBE":
           return sendResponse({ ok: true, anomaly: naukriScrape.checkAnomaly() });
 

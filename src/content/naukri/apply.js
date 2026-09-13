@@ -9,12 +9,63 @@
           naukriApplicationSubmitted, naukriProfileIncomplete, naukriScrape */
 
 const Q = () => NAUKRI_SEL.questionnaire;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Wait for the visible job-detail Apply button while Naukri hydrates React. */
+async function waitForApplyButton(timeoutMs = 12000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const button = naukriVisible(NAUKRI_SEL.job.applyButton);
+    if (button && !button.disabled && /^apply$/i.test(button.innerText.trim())) return button;
+    await sleep(250);
+  }
+  return null;
+}
+
+/**
+ * Open only Naukri's in-page application drawer. A successful click must
+ * produce either the drawer or the platform's applied state; otherwise the
+ * caller receives the exact diagnostic instead of pretending it applied.
+ */
+async function openApplicationDrawer() {
+  if (naukriVisible(Q().drawer)) return { ok: true };
+  const button = await waitForApplyButton();
+  if (!button) {
+    return { ok: false, reason: "Naukri Apply button was not visible after waiting 12 seconds." };
+  }
+  button.scrollIntoView({ block: "center", inline: "center" });
+  button.focus();
+  button.click();
+
+  for (let attempt = 0; attempt < 32; attempt++) {
+    if (naukriApplicationSubmitted()) return { ok: true, submitted: true };
+    if (naukriVisible(Q().drawer)) return { ok: true };
+    const anomaly = naukriScrape.checkAnomaly();
+    if (anomaly) return { ok: false, blocked: true, reason: anomaly };
+    await sleep(250);
+  }
+  return {
+    ok: false,
+    reason: "Naukri Apply button was clicked, but no application drawer or submission confirmation appeared within 8 seconds.",
+  };
+}
 
 /** Latest unanswered bot message in the drawer. */
 function currentQuestion() {
   const msgs = [...document.querySelectorAll(Q().botMessage)];
   const last = msgs[msgs.length - 1];
   return last ? last.innerText.trim().replace(/\s+/g, " ") : null;
+}
+
+/** Click Naukri's explicit external-company control; navigation is observed by
+ * the worker because this document may unload immediately after the click. */
+function openExternalCompanySite() {
+  const control = document.querySelector(NAUKRI_SEL.job.externalApply);
+  if (!control) return { clicked: false, reason: "Naukri company-site button was not found." };
+  control.scrollIntoView({ block: "center", inline: "center" });
+  control.focus();
+  control.click();
+  return { clicked: true };
 }
 
 /**
@@ -49,8 +100,9 @@ function answerFromProfile(cls, profile) {
       }
 
       const skill = (profile.skills || []).find((s) => s.name.toLowerCase() === want);
-      // Unknown skill: report 0 rather than inventing experience.
-      return String(skill ? skill.years : 0);
+      // A skill omitted from a resume is ambiguous. Do not declare zero years
+      // unless the candidate explicitly disclaimed the skill above.
+      return skill ? String(skill.years) : null;
     }
     case "current_location":    return profile.location || null;
     case "preferred_locations": return (profile.preferredLocations || []).join(", ") || null;
@@ -79,8 +131,15 @@ async function answerOne(question, profile, resumeFile) {
       question,
       classification: cls,
     });
-    if (!res || !res.ok || !res.answer) {
-      return { handled: false, reason: "unanswerable: " + question };
+    if (!res || !res.ok || res.action === "ASK" || res.action === "CONFIRM" || !res.answer) {
+      return {
+        handled: false,
+        waitingForUser: true,
+        confirm: res && res.action === "CONFIRM",
+        suggested: res && res.answer,
+        profileHint: res && res.profileHint,
+        reason: "unanswerable: " + question,
+      };
     }
     value = res.answer;
   }
@@ -111,14 +170,28 @@ async function apply(job) {
     return { submitted: true, answered: [], reason: "already applied" };
   }
 
-  // An external posting is not an in-place application. Hand it back.
-  if (document.querySelector(NAUKRI_SEL.job.externalApply)) {
-    return { submitted: false, answered: [], reason: "external ATS - not applicable in place" };
+  // An external posting is not an in-place application. Hand its explicit
+  // HTTPS destination to the worker, which asks the user for that origin.
+  const externalControl = document.querySelector(NAUKRI_SEL.job.externalApply);
+  if (externalControl) {
+    const rawExternalUrl = externalControl.href || externalControl.dataset?.url || externalControl.dataset?.href || "";
+    let externalUrl = "";
+    try {
+      const candidate = new URL(rawExternalUrl, location.href);
+      if (candidate.protocol === "https:") externalUrl = candidate.href;
+    } catch {
+      // The generic adapter never receives a malformed or non-HTTPS URL.
+    }
+    return {
+      submitted: false,
+      answered: [],
+      external: true,
+      externalUrl,
+      reason: externalUrl
+        ? "External company application requires permission for its website."
+        : "External company application has no readable destination URL.",
+    };
   }
-
-  const btn = naukriVisible(NAUKRI_SEL.job.applyButton);
-  if (!btn) return { submitted: false, answered: [], reason: "no visible apply button" };
-  btn.click();
 
   const { profile, resumeFile } = await loadContext();
 
@@ -129,6 +202,10 @@ async function apply(job) {
       reason: "HALT: profile failed validation - refusing to submit invented data",
     };
   }
+
+  const opened = await openApplicationDrawer();
+  if (!opened.ok) return { submitted: false, answered: [], blocked: opened.blocked, reason: opened.reason };
+  if (opened.submitted) return { submitted: true, answered: [], reason: "already applied" };
   const answered = [];
   const seen = new Set();
 
@@ -162,7 +239,16 @@ async function apply(job) {
     const r = await answerOne(q, profile, resumeFile);
     answered.push({ question: q, ...r });
     if (!r.handled) {
-      return { submitted: false, answered, reason: r.reason };
+      return {
+        submitted: false,
+        answered,
+        waitingForUser: Boolean(r.waitingForUser),
+        question: q,
+        suggested: r.suggested || "",
+        confirm: Boolean(r.confirm),
+        profileHint: r.profileHint || null,
+        reason: r.reason,
+      };
     }
   }
 
@@ -183,4 +269,22 @@ async function loadContext() {
   return { profile: (res && res.profile) || {}, resumeFile };
 }
 
-globalThis.naukriApply = { apply, classify, currentQuestion, answerFromProfile };
+async function continueApply(job, providedAnswer) {
+  if (providedAnswer) {
+    const T = naukriType;
+    const input = await naukriWaitFor(Q().input, 8000);
+    if (input) {
+      await T.typeInto(input, providedAnswer);
+      const btn = T.commitButton();
+      if (btn) btn.click();
+      else T.pressEnter(input);
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+  }
+  return apply(job);
+}
+
+globalThis.naukriApply = {
+  apply, continueApply, classify, currentQuestion, answerFromProfile,
+  openApplicationDrawer, openExternalCompanySite,
+};

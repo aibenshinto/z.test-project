@@ -14,6 +14,7 @@ document.querySelectorAll("nav button").forEach((b) => {
     if (b.dataset.tab === "answers") renderBank();
     if (b.dataset.tab === "jobs") renderQueue();
     if (b.dataset.tab === "profile") loadProfile();
+    if (b.dataset.tab === "run") renderRun();
   };
 });
 
@@ -86,16 +87,40 @@ async function loadProfile() {
   $("pYears").value = p.totalYears != null ? p.totalYears : "";
   $("pPreferred").value = (p.preferredLocations || []).join(", ");
   $("pSkills").value = (p.skills || []).map((s) => `${s.name}: ${s.years}`).join("\n");
+  $("pEmail").value = p.email || ""; $("pPhone").value = p.phone || "";
+  $("pNotice").value = p.noticePeriodDays != null ? p.noticePeriodDays : "";
+  $("pRemote").value = p.remotePreference || "";
+  $("pWorkAuth").value = p.workAuthorization || "";
+  $("pVisa").value = p.visaSponsorship || "";
+  $("pCurrentSalary").value = p.currentSalary || "";
+  $("pSalaryExpectation").value = p.salaryExpectation || "";
+  $("pRelocate").checked = p.willingToRelocate === true;
+  const { preferences: pref } = await getSettings();
+  $("prefTitles").value = (pref.jobTitles || []).join(", ");
+  $("prefLocations").value = (pref.locations || []).join(", ");
+  $("prefAnywhereIndia").checked = pref.applyAnywhereInIndia === true;
+  $("prefExpMin").value = pref.experienceRange?.min ?? "";
+  $("prefExpMax").value = pref.experienceRange?.max ?? "";
+  $("prefEmployment").value = (pref.employmentTypes || []).join(", ");
+  $("prefExcludeCompanies").value = (pref.companiesToExclude || []).join(", ");
+  $("prefIncludeKeywords").value = (pref.keywordsToInclude || []).join(", ");
+  $("prefExcludeKeywords").value = (pref.keywordsToExclude || []).join(", ");
   showCheck(p);
 }
+
+const csv = (value) => value.split(",").map((s) => s.trim()).filter(Boolean);
 
 $("pHeadline").oninput = () => {
   const n = $("pHeadline").value.length;
   $("pHeadlineLen").textContent = `${n} characters${n < 50 ? " — needs 50+" : " ✓"}`;
 };
 
-function readProfileForm() {
+async function readProfileForm() {
+  // Preserve parsed education, projects, links, and other fields the compact
+  // editor does not display. Saving a small correction must not erase them.
+  const existing = (await getProfile()) || {};
   return {
+    ...existing,
     fullName: $("pName").value.trim(),
     currentTitle: $("pTitle").value.trim(),
     headline: $("pHeadline").value.trim(),
@@ -107,6 +132,15 @@ function readProfileForm() {
       if (!name || !name.trim()) return null;
       return { name: name.trim(), years: parseFloat(years) || 0 };
     }).filter(Boolean),
+    email: $("pEmail").value.trim(),
+    phone: $("pPhone").value.trim(),
+    noticePeriodDays: $("pNotice").value === "" ? undefined : Number($("pNotice").value),
+    remotePreference: $("pRemote").value,
+    workAuthorization: $("pWorkAuth").value.trim(),
+    visaSponsorship: $("pVisa").value.trim(),
+    currentSalary: $("pCurrentSalary").value.trim(),
+    salaryExpectation: $("pSalaryExpectation").value.trim(),
+    willingToRelocate: $("pRelocate").checked,
   };
 }
 
@@ -131,10 +165,52 @@ $("loadSeed").onclick = async () => {
 };
 
 $("saveProfile").onclick = async () => {
-  const p = readProfileForm();
-  try { await setProfile(p); log("profile saved"); }
+  const p = await readProfileForm();
+  let saved = false;
+  try { await setProfile(p); saved = true; log("profile saved"); }
   catch (e) { log(e.message); }
   showCheck(p); loadSetup();
+  if (saved) {
+    const pending = await chrome.runtime.sendMessage({ type: "PROFILE_UPDATED" });
+    if (pending?.pending) {
+      $("profileGuidance").hidden = false;
+      $("profileGuidance").textContent = pending.suggested
+        ? "Profile saved. The paused application now has a suggested answer; return to Run and confirm it."
+        : "Profile saved. The paused application still needs an explicit answer; return to Run to provide it.";
+      await renderRun();
+    }
+  }
+};
+
+$("deleteData").onclick = async () => {
+  if (!confirm("Delete the resume, profile, answers, application history, logs, and API keys stored by this extension?")) return;
+  await chrome.runtime.sendMessage({ type: "DELETE_DATA" });
+  log("all extension data deleted");
+  await loadSetup();
+  await loadProfile();
+  await renderQueue();
+  await renderRun();
+};
+
+$("savePreferences").onclick = async () => {
+  const { preferences } = await getSettings();
+  const min = $("prefExpMin").value;
+  const max = $("prefExpMax").value;
+  await patchSettings({ preferences: {
+    ...preferences,
+    jobTitles: csv($("prefTitles").value),
+    locations: csv($("prefLocations").value),
+    applyAnywhereInIndia: $("prefAnywhereIndia").checked,
+    experienceRange: {
+      min: min === "" ? 0 : Number(min),
+      max: max === "" ? 10 : Number(max),
+    },
+    employmentTypes: csv($("prefEmployment").value),
+    companiesToExclude: csv($("prefExcludeCompanies").value),
+    keywordsToInclude: csv($("prefIncludeKeywords").value),
+    keywordsToExclude: csv($("prefExcludeKeywords").value),
+  }});
+  log("preferences saved");
 };
 
 // ---- jobs ----------------------------------------------------------------
@@ -143,14 +219,72 @@ $("scrape").onclick = async () => {
   if (!url) return log("enter a search URL");
   log("scraping…");
   const r = await chrome.runtime.sendMessage({ type: "SCRAPE", url });
-  log(r && r.ok ? `queued ${r.added} new (${r.seen} seen)` : `scrape failed: ${r && r.error}`);
+  log(r && r.ok
+    ? `added ${r.added} profile-matched jobs (${r.review} review, ${r.filtered} filtered out, ${r.duplicate} already known)`
+    : `scrape failed: ${r && r.error}`);
   renderQueue();
 };
 
 $("clearQueue").onclick = async () => { await set("queue", []); renderQueue(); log("queue cleared"); };
 
+function listDetail(label, values) {
+  const items = (values || []).filter(Boolean);
+  return items.length
+    ? `<div><b>${esc(label)}</b><ul>${items.map((value) => `<li>${esc(value)}</li>`).join("")}</ul></div>`
+    : "";
+}
+
+function jobUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" ? parsed.href : "";
+  } catch { return ""; }
+}
+
+function queueCard(job) {
+  const evaluation = job.evaluation || {};
+  const reasons = evaluation.reasons?.length ? evaluation.reasons : (job.result?.reason ? [job.result.reason] : []);
+  const decision = evaluation.decision || job.status || "UNKNOWN";
+  const applicationReason = job.error || job.result?.reason ||
+    (["needs_review", "blocked", "error"].includes(job.status)
+      ? "No diagnostic was stored by the earlier extension version. Retry after reloading to capture the exact site reason."
+      : "");
+  const applicationAttempted = Boolean(job.result) || ["needs_review", "blocked", "error", "waiting_for_user", "submitted"].includes(job.status);
+  const url = jobUrl(job.url);
+  return `<details class="card">
+    <summary><b>${esc(job.title)}</b> — ${esc(job.company || "Unknown company")}
+      <div class="meta">${esc(job.experience || "Experience not listed")} · ${esc(job.location || "Location not listed")}</div>
+      <div class="meta"><span class="pill">${esc(job.status)}</span>
+      ${job.match_score != null ? `<span class="pill">match ${esc(job.match_score)}%</span>` : ""}
+      <span class="pill">decision ${esc(decision)}</span></div>
+    </summary>
+    <div class="detail">
+      <div><b>Why this decision</b></div>
+      ${listDetail("Reasons", reasons) || `<div class="meta">No detailed reason was recorded for this job.</div>`}
+      ${listDetail("Missing requirements", evaluation.missing_requirements)}
+      ${listDetail("Risk flags", evaluation.risk_flags)}
+      ${applicationAttempted ? `<div><b>Application outcome</b></div>
+      <div class="meta">Status: ${esc(job.status)}</div>
+      ${applicationReason ? listDetail("Reason application could not continue", [applicationReason]) : `<div class="meta">No failure reason was supplied by the platform.</div>`}
+      ${job.result?.answered?.length ? `<div class="meta">Answered fields before stopping: ${job.result.answered.length}</div>` : ""}` : ""}
+      <div><b>Job details</b></div>
+      <div class="meta">Posted: ${esc(job.postedOn || "Not listed")} · Salary: ${esc(job.salary || "Not listed")}</div>
+      ${job.tags?.length ? `<div class="meta">Skills: ${esc(job.tags.join(", "))}</div>` : ""}
+      ${job.summary ? `<div class="meta" style="margin-top:5px">${esc(job.summary)}</div>` : ""}
+      ${url ? `<div style="margin-top:7px"><a href="${esc(url)}" target="_blank" rel="noreferrer">Open original job listing</a></div>` : ""}
+    </div>
+  </details>`;
+}
+
 async function renderQueue() {
-  const q = await get("queue", []);
+  // Existing installations may have old SKIP entries. They belong to neither
+  // the actionable queue nor the review list and are hidden until the next
+  // scrape removes them from storage.
+  const q = (await get("queue", [])).filter((job) => job.status !== "skipped");
+  $("queueOut").innerHTML = q.length
+    ? q.slice(0, 40).map(queueCard).join("")
+    : `<div class="meta">Queue is empty.</div>`;
+  return;
   $("queueOut").innerHTML = q.length
     ? q.slice(0, 40).map((j) => `
         <div class="card">
@@ -215,6 +349,89 @@ $("stop").onclick = async () => {
   log("run stopped"); renderStatus();
 };
 
+$("pause").onclick = async () => {
+  await chrome.runtime.sendMessage({ type: "PAUSE" });
+  log("run paused"); renderRun(); renderStatus();
+};
+
+$("resume").onclick = async () => {
+  await chrome.runtime.sendMessage({ type: "RESUME" });
+  log("run resumed"); renderRun(); renderStatus();
+};
+
+async function renderRun() {
+  const r = await chrome.runtime.sendMessage({ type: "GET_SESSION" });
+  if (!r || !r.ok) return;
+  const s = r.session || {};
+  const job = (r.queue || []).find((j) => j.id === s.jobId);
+  const title = job ? `${esc(job.title)} — ${esc(job.company || "")}` : "No active application.";
+  const failureReason = s.lastError || job?.error || job?.result?.reason || "";
+  $("currentRun").innerHTML = `<b>${title}</b><div class="meta">${esc(s.state || "IDLE")} · ${esc(s.progress?.action || "idle")}${job?.match_score != null ? ` · match ${job.match_score}%` : ""}</div>${failureReason ? `<div class="meta" style="margin-top:5px;color:var(--err)">Reason: ${esc(failureReason)}</div>` : ""}`;
+  const pending = s.pendingQuestion;
+  const needsInput = s.state === "WAITING_FOR_USER" || s.state === "BLOCKED";
+  $("actionRequired").hidden = !needsInput;
+  if (needsInput) {
+    $("pendingQuestion").textContent = pending?.question || pending?.reason || s.lastError || "Your input is required.";
+    $("pendingAnswer").value = pending?.suggested || "";
+    const permissionRequest = pending?.kind === "external_permission";
+    const answerHidden = pending?.kind === "blocked" || permissionRequest;
+    $("pendingAnswer").hidden = answerHidden;
+    $("pendingAnswerLabel").hidden = answerHidden;
+    $("answerReuseNote").hidden = answerHidden;
+    const stopReason = pending?.reason && pending.reason !== pending.question ? pending.reason : "";
+    $("pendingReason").hidden = !stopReason;
+    $("pendingReason").textContent = stopReason ? `Why we paused: ${stopReason}` : "";
+    $("continueAnswer").hidden = pending?.kind === "blocked" || permissionRequest;
+    $("enableExternal").hidden = !permissionRequest;
+    const hint = pending?.profileHint;
+    $("editProfile").hidden = !hint || pending?.kind === "blocked" || permissionRequest;
+    $("profilePrompt").hidden = !hint || pending?.kind === "blocked" || permissionRequest;
+    if (hint) $("profilePrompt").textContent = `Complete profile: ${hint.help || hint.label}`;
+  } else {
+    $("editProfile").hidden = true;
+    $("enableExternal").hidden = true;
+    $("profilePrompt").hidden = true;
+    $("pendingReason").hidden = true;
+  }
+  $("log").textContent = (r.log || []).map((e) =>
+    `${new Date(e.at).toLocaleTimeString()}  ${e.level.toUpperCase()}  ${e.message}${e.extra?.reason ? ` — ${e.extra.reason}` : ""}`).join("\n");
+}
+
+$("continueAnswer").onclick = async () => {
+  const answer = $("pendingAnswer").value.trim();
+  if (!answer) return log("enter an answer first");
+  const r = await chrome.runtime.sendMessage({ type: "USER_ANSWER", answer });
+  log(r?.ok ? "answer saved for future matching questions; continuing application" : `could not continue: ${r?.error || "unknown error"}`);
+  renderRun();
+};
+
+$("editProfile").onclick = async () => {
+  const r = await chrome.runtime.sendMessage({ type: "GET_SESSION" });
+  const hint = r?.session?.pendingQuestion?.profileHint;
+  if (!hint?.fieldId) return;
+  $("profileGuidance").hidden = false;
+  $("profileGuidance").textContent = `Application paused: ${hint.help || `complete ${hint.label}`}`;
+  document.querySelector('nav button[data-tab="profile"]').click();
+  await loadProfile();
+  requestAnimationFrame(() => {
+    const field = $(hint.fieldId);
+    field?.focus();
+    field?.scrollIntoView({ block: "center", behavior: "smooth" });
+  });
+};
+
+$("enableExternal").onclick = async () => {
+  const result = await chrome.runtime.sendMessage({ type: "ENABLE_EXTERNAL_SITE" });
+  log(result?.ok ? "company-site permission granted; continuing application" : `company-site permission not granted: ${result?.error || "unknown error"}`);
+  renderRun();
+  renderQueue();
+};
+
+$("skipJob").onclick = async () => {
+  await chrome.runtime.sendMessage({ type: "SKIP_JOB" });
+  log("application skipped"); renderRun();
+};
+
 $("clearHalt").onclick = async () => {
   await chrome.storage.local.remove(["haltedAt", "haltReason"]);
   log("halt cleared"); renderStatus();
@@ -223,5 +440,5 @@ $("clearHalt").onclick = async () => {
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-loadSetup(); loadGov(); renderStatus();
-setInterval(renderStatus, 5000);
+loadSetup(); loadGov(); renderStatus(); renderRun();
+setInterval(() => { renderStatus(); renderRun(); }, 5000);

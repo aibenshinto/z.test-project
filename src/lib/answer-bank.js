@@ -1,14 +1,17 @@
-// Screening-question cache. ~90% of questions repeat across applications, so
-// after the first week almost every lookup is a free, instant, consistent hit.
-// Only genuine cache misses reach an LLM.
+// Screening-question cache. Cache / similarity first; LLM only on a miss.
+// Sensitive topics never auto-fill from a model guess.
 
-import { get, set } from "./storage.js";
+import { get, set, getSettings } from "./storage.js";
 import { askJSON } from "./llm/index.js";
+import {
+  normalizeQuestion,
+  findSimilarAnswer,
+  isSensitiveQuestion,
+  classifyQuestion,
+  answerFromProfile,
+} from "./questions.js";
 
 const BANK_KEY = "answerBank";
-
-const normalize = (q) =>
-  q.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
 
 const ANSWER_SCHEMA = {
   type: "object",
@@ -23,32 +26,74 @@ const ANSWER_SCHEMA = {
 
 export async function lookup(question) {
   const bank = await get(BANK_KEY, {});
-  return bank[normalize(question)] ?? null;
+  const hit = findSimilarAnswer(bank, question);
+  return hit ? { ...hit.entry, similarity: hit.similarity } : null;
 }
 
-export async function remember(question, answer, { source = "user" } = {}) {
+export async function remember(question, answer, { source = "user", confidence = 1 } = {}) {
   const bank = await get(BANK_KEY, {});
-  bank[normalize(question)] = {
+  bank[normalizeQuestion(question)] = {
     answer,
     source,
-    question,                 // keep the original for the settings UI
+    confidence,
+    question,
     updatedAt: Date.now(),
   };
   await set(BANK_KEY, bank);
 }
 
+function bands(settings) {
+  const c = settings?.confidence || {};
+  return { auto: c.auto ?? 0.85, confirm: c.confirm ?? 0.6 };
+}
+
+function decideAction({ source, confidence, question, settings }) {
+  const { auto, confirm } = bands(settings);
+  const sensitive = isSensitiveQuestion(question);
+  if (source === "user" || source === "excluded" || source === "profile") {
+    if (sensitive && source !== "user") return "CONFIRM";
+    return "FILL";
+  }
+  if (sensitive) return "CONFIRM";
+  if (confidence >= auto) return "FILL";
+  if (confidence >= confirm) return "CONFIRM";
+  return "ASK";
+}
+
 /**
- * Resolve a screening question. Cache first; LLM only on a miss.
- * Returns { answer, source, confidence } or null if it needs a human.
+ * @returns {Promise<{
+ *   action: "FILL"|"CONFIRM"|"ASK",
+ *   answer?: string,
+ *   source?: string,
+ *   confidence?: number
+ * }>}
  */
 export async function resolve(question, options, profile) {
-  const hit = await lookup(question);
-  if (hit) return { ...hit, confidence: 1 };
+  const settings = await getSettings();
 
-  // Never let the model answer for a skill the user has disclaimed.
-  const m = question.toLowerCase().match(/experience do you have in (.+?)\?/);
-  if (m && (profile.excludedSkills || []).some((s) => s.toLowerCase() === m[1].trim())) {
-    return { answer: "0", source: "excluded", confidence: 1 };
+  const hit = await lookup(question);
+  if (hit) {
+    const action = decideAction({
+      source: hit.source,
+      confidence: hit.confidence ?? 1,
+      question,
+      settings,
+    });
+    return { action, answer: hit.answer, source: hit.source, confidence: hit.confidence ?? 1 };
+  }
+
+  const cls = classifyQuestion(question);
+  const fromProfile = answerFromProfile(cls, profile || {});
+  if (fromProfile != null) {
+    const source = cls.kind === "experience_in" && fromProfile === "0"
+      && (profile.excludedSkills || []).some((s) => question.toLowerCase().includes(String(s).toLowerCase()))
+      ? "excluded"
+      : "profile";
+    const action = decideAction({ source, confidence: 1, question, settings });
+    if (action === "FILL") {
+      await remember(question, fromProfile, { source, confidence: 1 });
+    }
+    return { action, answer: fromProfile, source, confidence: 1 };
   }
 
   const result = await askJSON({
@@ -66,12 +111,19 @@ export async function resolve(question, options, profile) {
     schema: ANSWER_SCHEMA,
   });
 
-  // Low confidence means the profile did not support an answer. Do not guess
-  // on an application - queue it for the user instead.
-  if (result.confidence < 0.5) return null;
-
-  await remember(question, result.answer, { source: "llm" });
-  return { answer: result.answer, source: "llm", confidence: result.confidence };
+  const action = decideAction({
+    source: "llm",
+    confidence: result.confidence,
+    question,
+    settings,
+  });
+  if (action === "ASK") {
+    return { action: "ASK", answer: undefined, source: "llm", confidence: result.confidence };
+  }
+  if (action === "FILL") {
+    await remember(question, result.answer, { source: "llm", confidence: result.confidence });
+  }
+  return { action, answer: result.answer, source: "llm", confidence: result.confidence };
 }
 
 export async function exportBank() {

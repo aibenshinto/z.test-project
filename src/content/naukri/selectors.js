@@ -39,7 +39,9 @@ const SEL = {
     // VERIFIED. NOTE: #apply-button appears TWICE on the page - once in the
     // sticky header, once in the body - so the id is not unique and
     // querySelector() may return the hidden one. Always pick a visible node.
-    applyButton:   "#apply-button, .apply-button",
+    // Matches the live button exactly: <button id="apply-button"
+    // class="styles_apply-button__<hash> apply-button">Apply</button>.
+    applyButton:   "#apply-button.apply-button, #apply-button, button.apply-button",
     saveButton:    "[class*='styles_save-job-button']",
     description:   "[class*='JDC__dang-inner-html']",
     headerTitle:   "[class*='styles_jd-header-title']",
