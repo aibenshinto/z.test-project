@@ -40,6 +40,9 @@
         "src/content/naukri/selectors.js",
         "src/content/naukri/typing.js",
         "src/content/naukri/scrape.js",
+        "src/content/naukri/observer.js",
+        "src/content/naukri/executor.js",
+        "src/content/naukri/agent-loop.js",
         "src/content/naukri/apply.js",
         "src/content/naukri/main.js"
       ],

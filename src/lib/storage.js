@@ -11,6 +11,7 @@ const DEFAULTS = {
       parseResume:    { provider: "gemini", model: "gemini-flash-latest", maxTokens: 8192 },
       rankJob:        { provider: "gemini", model: "gemini-flash-latest", maxTokens: 2048 },
       answerQuestion: { provider: "gemini", model: "gemini-flash-latest", maxTokens: 1024 },
+      uiAction:       { provider: "gemini", model: "gemini-flash-latest", maxTokens: 2048 },
     },
   },
   profile: null,          // structured resume, produced once by parseResume

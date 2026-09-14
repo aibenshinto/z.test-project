@@ -4,9 +4,21 @@
 // Naukri reuses the same drawer for profile-completion nagging and for generic
 // job recommendations, and in both cases no application is ever created. The
 // only proof of success is the Apply button changing state.
+//
+// Two application modes coexist:
+//   "agent"   — radio/form questionnaire panels handled by the AI agent loop
+//               (naukriAgentLoop). This is the NEW path added by the AI agent
+//               architecture.
+//   "chatbot" — free-text chatbot drawer handled by the existing answerOne()
+//               loop. This path is PRESERVED exactly as it was.
+//
+// detectApplicationMode() picks which path to use. The caller (apply()) tries
+// the agent path first; if no questionnaire panel is visible it falls back to
+// the chatbot path.
 
 /* global NAUKRI_SEL, naukriWaitFor, naukriVisible, naukriType,
-          naukriApplicationSubmitted, naukriProfileIncomplete, naukriScrape */
+          naukriApplicationSubmitted, naukriProfileIncomplete, naukriScrape,
+          naukriAgentLoop */
 
 const Q = () => NAUKRI_SEL.questionnaire;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -162,6 +174,34 @@ async function answerOne(question, profile, resumeFile) {
  * Resolves { submitted, answered, reason } - `submitted` is authoritative and
  * derived only from page state.
  */
+// ---------------------------------------------------------------------------
+// Application mode detection (Phase 6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Determine which application path is appropriate for the current DOM:
+ *   "agent"   — a radio/select questionnaire panel is visible (new AI path)
+ *   "chatbot" — the Naukri chatbot drawer is visible (existing text path)
+ *   "done"    — already submitted
+ *   "unknown" — neither; caller should wait or retry
+ */
+function detectApplicationMode() {
+  if (naukriApplicationSubmitted()) return "done";
+
+  // Radio/form questionnaire panels — Naukri's multi-choice style
+  const hasQuestionnaire =
+    document.querySelector(".singleselect-radiobutton") ||
+    document.querySelector(".ssrc__radio-btn-container") ||
+    document.querySelector("[class*='questionnaire']") ||
+    document.querySelector("[class*='Questionnaire']");
+  if (hasQuestionnaire) return "agent";
+
+  // Chatbot drawer (existing free-text path)
+  if (naukriVisible(Q().drawer)) return "chatbot";
+
+  return "unknown";
+}
+
 async function apply(job) {
   const anomaly = naukriScrape.checkAnomaly();
   if (anomaly) throw new Error(anomaly);
@@ -206,6 +246,17 @@ async function apply(job) {
   const opened = await openApplicationDrawer();
   if (!opened.ok) return { submitted: false, answered: [], blocked: opened.blocked, reason: opened.reason };
   if (opened.submitted) return { submitted: true, answered: [], reason: "already applied" };
+
+  // ---------------------------------------------------------------------------
+  // Route to AI agent loop if a radio/form questionnaire is visible (Phase 6).
+  // Fall through to the existing chatbot-drawer path otherwise.
+  // resumeFile was already obtained from loadContext() above.
+  // ---------------------------------------------------------------------------
+  const mode = detectApplicationMode();
+  if (mode === "agent") {
+    return naukriAgentLoop.runAgentLoop({ resumeFile });
+  }
+
   const answered = [];
   const seen = new Set();
 
@@ -286,5 +337,5 @@ async function continueApply(job, providedAnswer) {
 
 globalThis.naukriApply = {
   apply, continueApply, classify, currentQuestion, answerFromProfile,
-  openApplicationDrawer, openExternalCompanySite,
+  openApplicationDrawer, openExternalCompanySite, detectApplicationMode,
 };
