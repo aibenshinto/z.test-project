@@ -24,11 +24,30 @@ const Q = () => NAUKRI_SEL.questionnaire;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Wait for the visible job-detail Apply button while Naukri hydrates React. */
-async function waitForApplyButton(timeoutMs = 12000) {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const button = naukriVisible(NAUKRI_SEL.job.applyButton);
-    if (button && !button.disabled && /^apply$/i.test(button.innerText.trim())) return button;
+async function waitForApplyButton(timeoutMs = 20000) {
+  const SEL = NAUKRI_SEL.job.applyButton;
+
+  // Phase 1: wait until at least one matching element exists in the DOM.
+  // naukriWaitFor polls every 200ms and correctly handles React hydration
+  // delays — the button is absent until React mounts, not just invisible.
+  const appeared = await naukriWaitFor(SEL, timeoutMs);
+  if (!appeared) return null;
+
+  // Phase 2: the element is now in the DOM. Pick the visible copy (the button
+  // appears twice on the page) and verify its label is an apply-intent.
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const button = naukriVisible(SEL);
+    if (button && !button.disabled) {
+      const label = String(button.innerText || button.value || "").trim().toLowerCase();
+      // Accept: "Apply", "Apply Now", "Easy Apply", "Apply for Job", etc.
+      // Reject: "Applied", "Already Applied", "Application Submitted" (done state).
+      // Reject: "Apply on company site" (external — handled before this call).
+      const isApplyIntent = /\bapply\b/.test(label)
+        && !/\bapplied\b|\bsubmitted\b|\balready\b/.test(label)
+        && !/company\s*site|external|company\s*website/i.test(label);
+      if (isApplyIntent) return button;
+    }
     await sleep(250);
   }
   return null;
@@ -40,25 +59,50 @@ async function waitForApplyButton(timeoutMs = 12000) {
  * caller receives the exact diagnostic instead of pretending it applied.
  */
 async function openApplicationDrawer() {
-  if (naukriVisible(Q().drawer)) return { ok: true };
+  // Already open states — return immediately with the correct mode.
+  if (naukriApplicationSubmitted()) return { ok: true, submitted: true };
+  if (naukriVisible(Q().drawer)) return { ok: true, mode: "chatbot" };
+  const mode0 = detectApplicationMode();
+  if (mode0 === "agent") return { ok: true, mode: "agent" };
+
   const button = await waitForApplyButton();
   if (!button) {
-    return { ok: false, reason: "Naukri Apply button was not visible after waiting 12 seconds." };
+    // Produce a diagnostic that includes what button label was actually found.
+    const anyBtn = naukriVisible(NAUKRI_SEL.job.applyButton);
+    const foundLabel = anyBtn ? `"${String(anyBtn.innerText || "").trim()}"` : "none";
+    return {
+      ok: false,
+      reason: `Naukri Apply button not found after 12 s. Found element with label ${foundLabel}. ` +
+              "The job may already be applied, require a fresh login, or use an unsupported button flow.",
+    };
   }
   button.scrollIntoView({ block: "center", inline: "center" });
   button.focus();
   button.click();
 
-  for (let attempt = 0; attempt < 32; attempt++) {
+  // Poll for any of the three success states: submitted, chatbot drawer,
+  // or radio/questionnaire panel.  48 × 250 ms = 12 s.
+  for (let attempt = 0; attempt < 48; attempt++) {
     if (naukriApplicationSubmitted()) return { ok: true, submitted: true };
-    if (naukriVisible(Q().drawer)) return { ok: true };
+    if (naukriVisible(Q().drawer)) return { ok: true, mode: "chatbot" };
+    const modeNow = detectApplicationMode();
+    if (modeNow === "agent") return { ok: true, mode: "agent" };
     const anomaly = naukriScrape.checkAnomaly();
     if (anomaly) return { ok: false, blocked: true, reason: anomaly };
     await sleep(250);
   }
+
+  // Nothing appeared — try to diagnose why.
+  const externalBtn = document.querySelector(NAUKRI_SEL.job.externalApply);
+  if (externalBtn) {
+    return {
+      ok: false,
+      reason: "Apply button opened an external company-site redirect instead of an in-page form. The external URL will be handled separately.",
+    };
+  }
   return {
     ok: false,
-    reason: "Naukri Apply button was clicked, but no application drawer or submission confirmation appeared within 8 seconds.",
+    reason: "Naukri Apply button was clicked but no application form, questionnaire panel, or submission confirmation appeared within 12 seconds. The job may require a complete Naukri profile or may use an unsupported application flow.",
   };
 }
 
@@ -169,13 +213,8 @@ async function answerOne(question, profile, resumeFile) {
   return { handled: true, value, via: "typed" };
 }
 
-/**
- * Drive one application to completion.
- * Resolves { submitted, answered, reason } - `submitted` is authoritative and
- * derived only from page state.
- */
 // ---------------------------------------------------------------------------
-// Application mode detection (Phase 6)
+// Application mode detection
 // ---------------------------------------------------------------------------
 
 /**
@@ -202,6 +241,31 @@ function detectApplicationMode() {
   return "unknown";
 }
 
+/**
+ * Find the "Apply on company site" external button, if present.
+ * Naukri renders this in several ways:
+ *   <button id="company-site-button">Apply on company site</button>
+ *   <a id="company-site-button" href="...">Apply on company site</a>
+ *   <button class="...">Apply on company site</button>  (no stable ID)
+ * We match by CSS selector first (most reliable), then fall back to text.
+ */
+function findExternalButton() {
+  const bySelector = document.querySelector(NAUKRI_SEL.job.externalApply);
+  if (bySelector) return bySelector;
+  // Text-based fallback: any visible button/link that mentions "company site".
+  return [...document.querySelectorAll("button, a")].find((el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    const t = String(el.innerText || el.textContent || "").toLowerCase().trim();
+    return /apply.*(company|company site|external)/.test(t) || /company site/.test(t);
+  }) || null;
+}
+
+/**
+ * Drive one application to completion.
+ * Resolves { submitted, answered, reason } - `submitted` is authoritative and
+ * derived only from page state.
+ */
 async function apply(job) {
   const anomaly = naukriScrape.checkAnomaly();
   if (anomaly) throw new Error(anomaly);
@@ -212,9 +276,15 @@ async function apply(job) {
 
   // An external posting is not an in-place application. Hand its explicit
   // HTTPS destination to the worker, which asks the user for that origin.
-  const externalControl = document.querySelector(NAUKRI_SEL.job.externalApply);
+  const externalControl = findExternalButton();
   if (externalControl) {
-    const rawExternalUrl = externalControl.href || externalControl.dataset?.url || externalControl.dataset?.href || "";
+    // Try all plausible URL carriers: href, data-url, data-href, data-redirect-url.
+    const rawExternalUrl =
+      externalControl.getAttribute("href") ||
+      externalControl.dataset?.url ||
+      externalControl.dataset?.href ||
+      externalControl.dataset?.redirectUrl ||
+      "";
     let externalUrl = "";
     try {
       const candidate = new URL(rawExternalUrl, location.href);
@@ -247,12 +317,10 @@ async function apply(job) {
   if (!opened.ok) return { submitted: false, answered: [], blocked: opened.blocked, reason: opened.reason };
   if (opened.submitted) return { submitted: true, answered: [], reason: "already applied" };
 
-  // ---------------------------------------------------------------------------
-  // Route to AI agent loop if a radio/form questionnaire is visible (Phase 6).
-  // Fall through to the existing chatbot-drawer path otherwise.
-  // resumeFile was already obtained from loadContext() above.
-  // ---------------------------------------------------------------------------
-  const mode = detectApplicationMode();
+  // Route to the correct application path based on what openApplicationDrawer detected.
+  // This avoids a second DOM walk and is immune to race conditions between
+  // the drawer click and the questionnaire panel animating in.
+  const mode = opened.mode || detectApplicationMode();
   if (mode === "agent") {
     return naukriAgentLoop.runAgentLoop({ resumeFile });
   }
@@ -337,5 +405,5 @@ async function continueApply(job, providedAnswer) {
 
 globalThis.naukriApply = {
   apply, continueApply, classify, currentQuestion, answerFromProfile,
-  openApplicationDrawer, openExternalCompanySite, detectApplicationMode,
+  openApplicationDrawer, openExternalCompanySite, detectApplicationMode, findExternalButton,
 };

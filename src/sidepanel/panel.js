@@ -37,6 +37,14 @@ async function loadSetup() {
   $("apiKey").value = st.llm.keys[p] || "";
   $("model").value = st.llm.routes.default.model || "";
   $("keyHint").textContent = { gemini: "aistudio.google.com", claude: "console.anthropic.com", openai: "platform.openai.com" }[p] || "";
+  // UI Agent route
+  const uiRoute = st.llm.routes.uiAction || {};
+  if ($("uiProvider")) $("uiProvider").value = uiRoute.provider || "gemini";
+  if ($("uiModel")) {
+    const m = uiRoute.model || "gemini-2.0-flash";
+    const opt = $("uiModel").querySelector(`option[value="${m}"]`);
+    if (opt) $("uiModel").value = m;
+  }
   const prof = await getProfile();
   const res = await getResume();
   $("profileOut").textContent = prof
@@ -50,14 +58,30 @@ $("saveKey").onclick = async () => {
   const st = await getSettings();
   const p = $("provider").value;
   st.llm.keys[p] = $("apiKey").value.trim();
-  // Point every task at the chosen provider.
+  // Point every task at the chosen provider -- EXCEPT uiAction which has its own control.
   for (const k of Object.keys(st.llm.routes)) {
+    if (k === "uiAction") continue;
     st.llm.routes[k].provider = p;
     st.llm.routes[k].model = $("model").value.trim() || st.llm.routes[k].model;
   }
   await patchSettings({ llm: st.llm });
   log(`provider set to ${p}`);
   loadSetup();
+};
+
+$("saveUiAgent").onclick = async () => {
+  const st = await getSettings();
+  const p = $("uiProvider").value;
+  const m = $("uiModel").value;
+  if (!st.llm.routes.uiAction) st.llm.routes.uiAction = {};
+  st.llm.routes.uiAction.provider  = p;
+  st.llm.routes.uiAction.model     = m;
+  st.llm.routes.uiAction.maxTokens = 2048;
+  await patchSettings({ llm: st.llm });
+  const hint = $("uiAgentStatus");
+  hint.textContent = `✓ UI agent set to ${p} / ${m}`;
+  setTimeout(() => { hint.textContent = ""; }, 3000);
+  log(`UI agent set to ${p} / ${m}`);
 };
 
 $("uploadResume").onclick = async () => {
@@ -393,6 +417,9 @@ async function renderRun() {
     $("profilePrompt").hidden = true;
     $("pendingReason").hidden = true;
   }
+  // Focus-tab button: only shown when there is an active agent tab.
+  const focusBtn = $("focusTab");
+  if (focusBtn) focusBtn.hidden = !s.tabId;
   $("log").textContent = (r.log || []).map((e) =>
     `${new Date(e.at).toLocaleTimeString()}  ${e.level.toUpperCase()}  ${e.message}${e.extra?.reason ? ` — ${e.extra.reason}` : ""}`).join("\n");
 }
@@ -431,6 +458,25 @@ $("skipJob").onclick = async () => {
   await chrome.runtime.sendMessage({ type: "SKIP_JOB" });
   log("application skipped"); renderRun();
 };
+
+$("focusTab").onclick = async () => {
+  const r = await chrome.runtime.sendMessage({ type: "FOCUS_TAB" });
+  if (!r?.ok) log("no active tab to focus — it may have been closed");
+};
+
+// Allow user to resume after manually filling a field.
+// For the generic (external ATS) adapter we send GENERIC_CONTINUE which
+// re-runs the agent loop from current DOM state without re-filling what
+// the user just typed. For Naukri/LinkedIn, USER_ANSWER is still correct.
+$("continueAnswer").onclick && ($("continueAnswer").onclick = async () => {
+  const answer = $("pendingAnswer").value.trim();
+  if (!answer) return log("enter an answer first");
+  const r = await chrome.runtime.sendMessage({ type: "USER_ANSWER", answer });
+  log(r?.ok
+    ? "answer saved; agent is resuming"
+    : `could not continue: ${r?.error || "unknown error"}`);
+  renderRun();
+});
 
 $("clearHalt").onclick = async () => {
   await chrome.storage.local.remove(["haltedAt", "haltReason"]);

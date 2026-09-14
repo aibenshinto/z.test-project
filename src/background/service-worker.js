@@ -265,7 +265,7 @@ async function applyToJob(job, session) {
     if (!t) tabId = null;
   }
   if (!tabId) {
-    const tab = await chrome.tabs.create({ url: job.url, active: false });
+    const tab = await chrome.tabs.create({ url: job.url, active: true });
     tabId = tab.id;
   }
   await saveSession({
@@ -303,6 +303,8 @@ async function applyToJob(job, session) {
         updatedAt: Date.now(),
       });
       await info("User input required", { question: result.question });
+      // Bring the stuck tab to the front so the user can see where the agent paused.
+      await chrome.tabs.update(tabId, { active: true }).catch(() => {});
       return result;
     }
 
@@ -408,8 +410,10 @@ async function userAnswerAndContinue(answer) {
   }
 
   const platform = platformFromJob(job);
+  // For the generic adapter: send GENERIC_CONTINUE so the agent-loop
+  // re-observes the current DOM state after the user filled a field manually.
   const result = adapterResult(await chrome.tabs.sendMessage(tabId, {
-    type: session.adapter === "generic" ? "GENERIC_APPLY" : platform.continueMessage,
+    type: session.adapter === "generic" ? "GENERIC_CONTINUE" : platform.continueMessage,
     job,
     answer,
   }));
@@ -534,7 +538,8 @@ async function handoffToExternalApplication(job, sourceTabId, result) {
 }
 
 async function beginExternalApplication(job, externalUrl) {
-  const tab = await chrome.tabs.create({ url: externalUrl, active: false });
+  // Open visibly so the user can watch the agent navigate the company site.
+  const tab = await chrome.tabs.create({ url: externalUrl, active: true });
   const tabId = tab.id;
   await saveSession({
     ...(await loadSession()),
@@ -548,10 +553,19 @@ async function beginExternalApplication(job, externalUrl) {
   });
   try {
     await waitForTab(tabId);
+    // Inject in dependency order: highlight ring → observer → executor → agent-loop → shim
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ["src/content/generic/apply.js"],
+      files: [
+        "src/content/shared/highlight.js",
+        "src/content/generic/observer.js",
+        "src/content/generic/executor.js",
+        "src/content/generic/agent-loop.js",
+        "src/content/generic/apply.js",
+      ],
     });
+    // Brief settle time for the agent-loop message listener to register.
+    await new Promise((r) => setTimeout(r, 300));
     const result = adapterResult(await chrome.tabs.sendMessage(tabId, { type: "GENERIC_APPLY", job }),
       "The company-site adapter did not return a result.");
     job.result = result;
@@ -572,6 +586,8 @@ async function beginExternalApplication(job, externalUrl) {
         updatedAt: Date.now(),
       });
       await info("Company-site user input required", { jobId: job.id, question: result.question });
+      // Keep the tab open and bring it to front so the user sees exactly where to type.
+      await chrome.tabs.update(tabId, { active: true }).catch(() => {});
       return result;
     }
     if (result?.blocked) {
@@ -692,7 +708,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await deleteAllUserData();
         return sendResponse({ ok: true });
 
-      case "AI_DECIDE_ACTION": {
+  
+    case "FOCUS_TAB": {
+      // Bring the current agent tab to the foreground (user wants to see where it paused).
+      const fSession = await loadSession();
+      if (fSession.tabId) {
+        await chrome.tabs.update(fSession.tabId, { active: true }).catch(() => {});
+        return sendResponse({ ok: true });
+      }
+      return sendResponse({ ok: false, error: "no active tab in session" });
+    }
+    case "AI_DECIDE_ACTION": {
         // The content script sends a UISnapshot; we return a validated AgentAction.
         // API keys never leave the service worker — this is the only correct
         // place to call the LLM for UI decisions.

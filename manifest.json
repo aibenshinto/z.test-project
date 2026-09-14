@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AutoApply",
-  "version": "0.1.0",
-  "description": "Resume-driven job search and application assistant for Naukri, LinkedIn and Indeed.",
+  "version": "0.2.0",
+  "description": "Resume-driven job search and application assistant for Naukri and LinkedIn.",
   "permissions": [
     "storage",
     "alarms",
@@ -37,6 +37,7 @@
         "https://*.naukri.com/*"
       ],
       "js": [
+        "src/content/shared/highlight.js",
         "src/content/naukri/selectors.js",
         "src/content/naukri/typing.js",
         "src/content/naukri/scrape.js",
@@ -53,8 +54,12 @@
         "https://*.linkedin.com/*"
       ],
       "js": [
+        "src/content/shared/highlight.js",
         "src/content/linkedin/selectors.js",
         "src/content/linkedin/scrape.js",
+        "src/content/linkedin/observer.js",
+        "src/content/linkedin/executor.js",
+        "src/content/linkedin/agent-loop.js",
         "src/content/linkedin/apply.js",
         "src/content/linkedin/main.js"
       ],

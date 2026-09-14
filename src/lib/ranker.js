@@ -71,7 +71,7 @@ export function heuristicScore(job, profile) {
   // --- location ---
   const prefs = (profile.preferredLocations || []).map(norm);
   const loc = norm(job.location);
-  // Job boards often list only an Indian city (for example “Bengaluru”), not
+  // Job boards often list only an Indian city (for example "Bengaluru"), not
   // its country. This explicit preference therefore treats India-based search
   // results as location matches without requiring every city in the profile.
   const nationwideIndia = Boolean(profile.applyAnywhereInIndia) ||
@@ -92,10 +92,22 @@ export function heuristicScore(job, profile) {
 
 /**
  * Optional model rerank of the shortlist. Falls back to the heuristic on any
- * failure - ranking must never be the thing that breaks a run.
+ * failure — ranking must never be the thing that breaks a run.
+ *
+ * RATE-LIMIT SAFETY: only reranks the jobs the heuristic scores in the
+ * uncertain middle band (0.45–0.80). Clear winners and clear losers are
+ * already decided; sending them to the model wastes quota and causes 429s.
+ * We also cap at 5 jobs per call to keep the payload small.
  */
 export async function modelRerank(jobs, profile, askJSON) {
   if (!jobs.length) return jobs;
+
+  const MAX_RERANK = 5;
+  const toRerank = jobs
+    .filter((j) => j.relevance >= 0.45 && j.relevance < 0.80)
+    .slice(0, MAX_RERANK);
+  if (!toRerank.length) return jobs;
+
   try {
     const res = await askJSON({
       task: "rankJob",
@@ -106,8 +118,8 @@ export async function modelRerank(jobs, profile, askJSON) {
       user: JSON.stringify({
         profile: { title: profile.currentTitle, years: profile.totalYears,
                    skills: profile.skills, excluded: profile.excludedSkills },
-        jobs: jobs.map((j) => ({ id: j.id, title: j.title, exp: j.experience,
-                                 location: j.location, tags: j.tags, summary: j.summary })),
+        jobs: toRerank.map((j) => ({ id: j.id, title: j.title, exp: j.experience,
+                                    location: j.location, tags: j.tags, summary: j.summary })),
       }),
       schema: {
         type: "object",
@@ -121,7 +133,7 @@ export async function modelRerank(jobs, profile, askJSON) {
         required: ["scores"],
       },
     });
-    const byId = new Map(res.scores.map((s) => [s.id, s]));
+    const byId = new Map((res.scores || []).map((s) => [s.id, s]));
     return jobs.map((j) => {
       const s = byId.get(j.id);
       return s ? { ...j, relevance: Math.max(0, Math.min(1, s.score)), why: s.why } : j;

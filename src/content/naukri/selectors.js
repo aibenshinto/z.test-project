@@ -50,7 +50,8 @@ const SEL = {
     // VERIFIED ABSENT on an on-Naukri posting; present when the posting hands
     // off to the employer's own site. Its presence means "skip, or route to an
     // ATS adapter" - it is NOT an apply-in-place job.
-    externalApply: "#company-site-button",
+    // Naukri renders this in multiple ways — match all known variants.
+    externalApply: "#company-site-button, [class*='company-site'], a[data-ga-track*='apply-company'], button[data-ga-track*='company-site']",
 
     alreadyApplied: "[class*='applied']",   // UNVERIFIED
   },
