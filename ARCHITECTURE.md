@@ -31,11 +31,17 @@ Service worker (src/background/service-worker.js)
         ├─ Resume / profile (PDF → Gemini JSON)
         ├─ Heuristic ranker + optional LLM rerank
         ├─ Answer bank (normalize → cache → LLM)
+        ├─ AI Decision Engine (ui-agent.js → askJSON → uiAction route)
         └─ LLM router (askJSON → Gemini / OpenAI / Claude)
                 │  tabs.create + tabs.sendMessage
                 ▼
 Naukri content scripts (classic, shared globals)
-        selectors → scrape / typing / apply → main.js bridge
+        selectors → scrape / typing
+        observer  → UI snapshot (element_N registry)
+        executor  → controlled action + verification
+        agent-loop → observe → AI_DECIDE_ACTION → execute → verify
+        apply     → chatbot-drawer path (preserved) + mode routing
+        main.js   → message bridge
                 ▼
 Authenticated Naukri pages (user session cookies)
 ```
@@ -54,8 +60,12 @@ There is **no backend**. All persistence is `chrome.storage.local`. The service 
 | Manual profile | Side panel + `profile.seed.json` |
 | Job scrape | Naukri SRP cards, dedupe by `data-job-id` |
 | Ranking | Local heuristic (skills / years / location / recency) + optional model rerank |
-| Apply driver | Naukri chatbot drawer; contenteditable typing; resume attach via DataTransfer |
-| Submission proof | Apply button text / applied marker — **not** “drawer opened” |
+| Apply driver | Naukri chatbot drawer (free-text path) **preserved**; new AI agent loop for radio/form questionnaires |
+| UI Observer | `observer.js` — DOM → compact `UISnapshot`; `element_N` registry; no raw HTML sent to AI |
+| AI Decision Engine | `src/lib/ui-agent.js` (worker-side); `buildCandidateContext`, `validateAction`, `decideAction`; `AI_DECIDE_ACTION` message |
+| Browser Action Executor | `executor.js` — resolves `element_N`, performs 10 controlled action types, verifies each action independently |
+| AI Agent Loop | `agent-loop.js` — observe → decide → execute → verify cycle; `submitted: true` only from `naukriApplicationSubmitted()` |
+| Submission proof | Apply button text / applied marker — **not** "drawer opened", **not** AI claim |
 | Anomalies | Visible reCAPTCHA iframe, registration redirect, rate-limit selectors; halt, do not bypass |
 | Governor | Daily/hourly caps, random delay, min relevance, master switch default **off** |
 | Answer cache | Normalized string key; LLM only on miss; confidence &lt; 0.5 → skip guess |
@@ -80,7 +90,7 @@ There is **no backend**. All persistence is `chrome.storage.local`. The service 
 | Platform abstraction | No (Naukri globals only) | Registry + LinkedIn + generic career-site adapter |
 | LinkedIn | Discovery plus bounded Easy Apply adapter | Live-DOM verification and generic external-ATS routing remain |
 | Content vs orchestration | Mostly yes | Apply loop still mixes Naukri DOM + answer policy in `apply.js` |
-| Form field types | Naukri chat text + file only | Generic inputs, selects, radios, checkboxes, dates |
+| Form field types | Naukri chat text + file only → **radio/select questionnaire panels now handled by AI agent loop** | Generic inputs, checkboxes, dates still pending |
 | Semantic question match | Weak (string normalize + Naukri templates) | Alias groups, similarity, confirmation band |
 | Human-in-the-loop pause | No — unanswerable → `needs_review`, tab **closed**, next job | Keep tab, `WAITING_FOR_USER`, sidebar prompt, save & continue |
 | Confidence bands | Low → null only | Auto / confirm / ask; sensitive categories always confirm unless user-sourced |
@@ -240,6 +250,21 @@ On service-worker restart: restore `agentSession` from storage; if `tabId` is go
 - Create: `tests/*.test.js`, `package.json` test script
 - Run: `npm test`
 
+### Step H — AI-controlled UI agent layer (2026-09-14)
+
+- Create: `src/content/naukri/observer.js` — DOM → UISnapshot; `element_N` registry
+- Create: `src/content/naukri/executor.js` — controlled Browser Action Executor + Verification Engine
+- Create: `src/content/naukri/agent-loop.js` — observe → AI decide → execute → verify loop
+- Create: `src/lib/ui-agent.js` — `buildCandidateContext`, `validateAction`, `decideAction` (worker-side, no DOM)
+- Modify: `src/content/naukri/apply.js` — add `detectApplicationMode()`; route radio/form questionnaire to agent loop; chatbot-drawer path unchanged
+- Modify: `src/background/service-worker.js` — import `ui-agent.js`; add `AI_DECIDE_ACTION` message handler
+- Modify: `manifest.json` — register three new content scripts before `apply.js`
+- Modify: `src/lib/storage.js` — add `uiAction` LLM task route
+- Create: `tests/ui-agent.test.js` — 20 new tests for context builder, action validator, decision engine
+- Why: the existing chatbot-drawer path only handles free-text inputs; Naukri's radio-button questionnaire panels require a flexible AI-driven approach that generalises across question types without hard-coded rules
+- Safety invariants enforced: AI cannot supply CSS selectors or JS code; API keys stay in the service worker; `submitted: true` requires `naukriApplicationSubmitted()` confirmation; missing candidate data → `ask_user`, never invented
+- Test: `npm test` — 27/27 pass (7 original + 20 new)
+
 ## 8. Non-goals for this increment
 
 Resume tailoring, cover letters, multiple profiles, interview prep, email tracking, Indeed adapter, CAPTCHA solving, automated login, Selenium.
@@ -288,3 +313,30 @@ requires an explicit completion indicator before recording a submission.
 
 External-company application links remain outside this adapter and are returned
 as an explicit handoff; no generic third-party ATS automation is claimed yet.
+
+### AI-controlled UI agent layer increment (2026-09-14)
+
+Four new files implement the AI → executor → verifier pipeline for Naukri's
+radio/form questionnaire panels:
+
+| File | Role |
+|---|---|
+| `src/content/naukri/observer.js` | Walks visible application DOM; produces compact `UISnapshot`; assigns temporary `element_N` IDs to interactive nodes |
+| `src/content/naukri/executor.js` | Resolves element IDs; performs 10 allowed action types using existing typing utilities; verifies each action independently |
+| `src/content/naukri/agent-loop.js` | Observe → `AI_DECIDE_ACTION` → execute → verify loop; terminates on `finish`/`stop`/`ask_user`/anomaly/`maxTurns` |
+| `src/lib/ui-agent.js` | Worker-side: `buildCandidateContext` (safe profile slice), `validateAction` (schema enforcement), `decideAction` (LLM call via `uiAction` task route) |
+
+The Naukri application driver (`apply.js`) now detects two modes via
+`detectApplicationMode()`:
+- **`"chatbot"`** — free-text drawer; the original `answerOne()` loop runs unchanged.
+- **`"agent"`** — radio/form questionnaire; the AI agent loop runs instead.
+
+Key constraints enforced in code:
+- The AI receives only a compact snapshot — never raw HTML.
+- The AI may only reference elements by their `element_N` ID — no CSS selectors, no XPath, no JavaScript.
+- `submitted: true` is set only after `naukriApplicationSubmitted()` returns true — never from an AI `finish` action alone.
+- API keys never reach content scripts; the `AI_DECIDE_ACTION` handler in the service worker is the sole LLM call site for UI decisions.
+- Missing candidate data always produces `ask_user`, not an invented value.
+- A new `uiAction` LLM task route in `storage.js` allows independent provider and model configuration for UI decisions.
+
+`npm test` now runs 27 tests (7 original + 20 new in `tests/ui-agent.test.js`); all pass.

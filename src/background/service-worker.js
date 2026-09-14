@@ -12,6 +12,7 @@ import { emptySession, transition, STATES } from "../lib/agent-fsm.js";
 import { info, warn, getLog } from "../lib/logger.js";
 import { platformFromJob, platformFromUrl } from "../lib/platforms.js";
 import { profileHintForQuestion } from "../lib/questions.js";
+import { decideAction, buildCandidateContext } from "../lib/ui-agent.js";
 
 const TICK = "autoapply-tick";
 const SESSION = "agentSession";
@@ -690,6 +691,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       case "DELETE_DATA":
         await deleteAllUserData();
         return sendResponse({ ok: true });
+
+      case "AI_DECIDE_ACTION": {
+        // The content script sends a UISnapshot; we return a validated AgentAction.
+        // API keys never leave the service worker — this is the only correct
+        // place to call the LLM for UI decisions.
+        const profile = await getProfile();
+        try {
+          const action = await decideAction(msg.snapshot, profile, askJSON);
+          return sendResponse({ ok: true, action });
+        } catch (err) {
+          // Retryable provider errors propagate the flag so the agent loop
+          // can distinguish transient from permanent failures.
+          return sendResponse({
+            ok: false,
+            error: String(err && err.message ? err.message : err),
+            retryable: Boolean(err && err.retryable),
+          });
+        }
+      }
 
       case "GET_APPLY_CONTEXT":
         return sendResponse({
