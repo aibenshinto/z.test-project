@@ -1,3 +1,4 @@
+
 # AutoApply architecture
 
 ## Inspection record — 2026-09-13
