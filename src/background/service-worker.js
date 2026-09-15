@@ -13,9 +13,26 @@ import { info, warn, getLog } from "../lib/logger.js";
 import { platformFromJob, platformFromUrl } from "../lib/platforms.js";
 import { profileHintForQuestion } from "../lib/questions.js";
 import { decideAction, buildCandidateContext } from "../lib/ui-agent.js";
+import {
+  isDebugEnabled, setDebugEnabled, recordDiagnostic, getDiagnostics,
+  clearDiagnostics, captureViewport, captureForModel, storeFailureCapture, getCaptures,
+} from "../lib/debug-store.js";
 
 const TICK = "autoapply-tick";
 const SESSION = "agentSession";
+
+/**
+ * Accept only http(s) URLs for agent-requested navigation.
+ * A `javascript:` or `data:` URL would be code execution by another name.
+ */
+function safeHttpUrl(raw) {
+  try {
+    const url = new URL(String(raw));
+    return (url.protocol === "https:" || url.protocol === "http:") ? url.href : null;
+  } catch (_) {
+    return null;
+  }
+}
 
 function adapterResult(value, fallbackReason = "The platform did not return a completion confirmation.") {
   if (!value) return { submitted: false, reason: fallbackReason };
@@ -198,6 +215,9 @@ async function tick() {
         jobId: next.id,
         title: next.title,
         status: next.status,
+        // APPLICATION_STATUS_UNKNOWN means the agent acted but could not prove
+        // the application was submitted — distinct from a confirmed failure.
+        applicationStatus: result.applicationStatus || "APPLICATION_STATUS_UNKNOWN",
         reason: result.reason || "The platform did not return a completion confirmation.",
       });
     }
@@ -558,6 +578,12 @@ async function beginExternalApplication(job, externalUrl) {
       target: { tabId },
       files: [
         "src/content/shared/highlight.js",
+        "src/content/shared/interaction-core-bridge.js",
+        "src/content/shared/observer-core.js",
+        "src/content/shared/pointer-actions.js",
+        "src/content/shared/diagnostics.js",
+        "src/content/shared/executor-core.js",
+        "src/content/shared/agent-loop-core.js",
         "src/content/generic/observer.js",
         "src/content/generic/executor.js",
         "src/content/generic/agent-loop.js",
@@ -681,7 +707,7 @@ async function skipWaitingJob() {
   return { ok: true };
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     switch (msg.type) {
       case "START":  await startRun();            return sendResponse({ ok: true });
@@ -724,8 +750,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         // place to call the LLM for UI decisions.
         const profile = await getProfile();
         try {
-          const action = await decideAction(msg.snapshot, profile, askJSON);
-          return sendResponse({ ok: true, action });
+          // A screenshot is attached only when the DOM observation was not
+          // enough (target not found, click had no effect, page ambiguous).
+          // Every turn sending an image would be slow and costly — Part 23.
+          const screenshot = msg.needVisual
+            ? await captureForModel(sender?.tab?.windowId)
+            : null;
+          if (msg.needVisual) {
+            await info("Visual context attached for AI decision", {
+              captured: Boolean(screenshot),
+              reason: msg.lastFailure?.verdict || "ambiguous page",
+            });
+          }
+          const action = await decideAction(msg.snapshot, profile, askJSON, {
+            screenshot,
+            lastFailure: msg.lastFailure || null,
+          });
+          return sendResponse({ ok: true, action, visual: Boolean(screenshot) });
         } catch (err) {
           // Retryable provider errors propagate the flag so the agent loop
           // can distinguish transient from permanent failures.
@@ -743,6 +784,110 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           profile: await getProfile(),
           resume: await getResume(),
         });
+
+      // ---- Interaction diagnostics (Part 14/15) ---------------------------
+
+      case "GET_DEBUG_MODE":
+        return sendResponse({ ok: true, debug: await isDebugEnabled() });
+
+      case "SET_DEBUG_MODE":
+        return sendResponse({ ok: true, debug: await setDebugEnabled(msg.debug) });
+
+      case "GET_DIAGNOSTICS":
+        return sendResponse({
+          ok: true,
+          diagnostics: await getDiagnostics(msg.limit || 50),
+          captures: await getCaptures(msg.captureLimit || 10),
+          debug: await isDebugEnabled(),
+        });
+
+      case "CLEAR_DIAGNOSTICS":
+        await clearDiagnostics();
+        return sendResponse({ ok: true });
+
+      case "CAPTURE_SCREENSHOT": {
+        const dataUrl = await captureViewport(sender?.tab?.windowId);
+        return sendResponse({ ok: Boolean(dataUrl), dataUrl });
+      }
+
+      case "CLICK_DIAGNOSTIC": {
+        // Always persist the structured record; capture screenshots only for
+        // failures while debug mode is on.
+        await recordDiagnostic(msg.record);
+        if (msg.captureScreenshots) {
+          const after = await captureViewport(sender?.tab?.windowId);
+          await storeFailureCapture({
+            record: msg.record,
+            before: msg.screenshotBefore || null,
+            after,
+            domSnapshot: msg.domSnapshot || null,
+            url: sender?.tab?.url,
+            title: sender?.tab?.title,
+          });
+        }
+        if (msg.record?.result && msg.record.result !== "ACTION_CONFIRMED") {
+          await warn("Interaction did not take effect", {
+            action: msg.record.action,
+            target: msg.record.target,
+            targetText: msg.record.targetText,
+            method: msg.record.method,
+            result: msg.record.result,
+            retries: msg.record.retryCount,
+          });
+        }
+        return sendResponse({ ok: true });
+      }
+
+      // ---- Tab-level actions requested by the agent -----------------------
+      //
+      // The content script cannot open, switch or close tabs. It asks here,
+      // and this handler validates the request — in particular, a navigation
+      // URL must be http(s), so a `javascript:` URL can never be navigated to.
+
+      case "AGENT_TAB_ACTION": {
+        const tabId = sender?.tab?.id;
+        try {
+          switch (msg.tabAction) {
+            case "navigate": {
+              const url = safeHttpUrl(msg.url);
+              if (!url) return sendResponse({ ok: false, error: "refused: only http(s) URLs may be navigated to" });
+              if (!tabId) return sendResponse({ ok: false, error: "no originating tab" });
+              await chrome.tabs.update(tabId, { url });
+              return sendResponse({ ok: true, url });
+            }
+            case "open_tab": {
+              const url = safeHttpUrl(msg.url);
+              if (!url) return sendResponse({ ok: false, error: "refused: only http(s) URLs may be opened" });
+              const created = await chrome.tabs.create({ url, active: true });
+              // The agent follows the application into the new tab.
+              await saveSession({ ...(await loadSession()), tabId: created.id, updatedAt: Date.now() });
+              return sendResponse({ ok: true, tabId: created.id });
+            }
+            case "switch_tab": {
+              const session = await loadSession();
+              const target = msg.tabId || session.tabId;
+              if (!target) return sendResponse({ ok: false, error: "no tab to switch to" });
+              await chrome.tabs.update(target, { active: true });
+              return sendResponse({ ok: true, tabId: target });
+            }
+            case "close_tab": {
+              // Refuse to close the tab the run depends on; that would strand
+              // the session with no way back to the application.
+              const session = await loadSession();
+              if (tabId && tabId === session.tabId) {
+                return sendResponse({ ok: false, error: "refused: this is the active application tab" });
+              }
+              if (!tabId) return sendResponse({ ok: false, error: "no originating tab" });
+              await chrome.tabs.remove(tabId);
+              return sendResponse({ ok: true });
+            }
+            default:
+              return sendResponse({ ok: false, error: `unknown tab action: ${msg.tabAction}` });
+          }
+        } catch (err) {
+          return sendResponse({ ok: false, error: String(err?.message || err) });
+        }
+      }
 
       case "RESOLVE_ANSWER": {
         const profile = await getProfile();

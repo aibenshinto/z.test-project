@@ -71,6 +71,9 @@ const USER_KEYS = [
   "llm", "profile", "resumeText", "resumeFile", "preferences", "answerBank",
   "queue", "eventLog", "submitLog", "agentSession", "haltedAt", "haltReason",
   "confidence", "governor", "searches",
+  // Interaction diagnostics. `debugCaptures` holds page screenshots, so a
+  // deletion request must clear these too.
+  "clickDiagnostics", "debugCaptures", "debugMode",
 ];
 
 /** User-initiated wipe of candidate data, history, keys, and session. */

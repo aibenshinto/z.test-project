@@ -17,7 +17,15 @@
 // Allowed action vocabulary
 // ---------------------------------------------------------------------------
 
+// Every action the model may request. Existing actions are retained verbatim;
+// the additions make this a general browser agent rather than a form filler.
+//
+// Deliberately absent, and never to be added: any action that executes a
+// model-supplied string as code (eval, Function, javascript: URLs, injected
+// script, arbitrary CSS selectors). The model addresses the page only through
+// element_N identifiers it was shown.
 const ALLOWED_ACTIONS = new Set([
+  // Original vocabulary — unchanged.
   "click",
   "type",
   "select",
@@ -28,7 +36,37 @@ const ALLOWED_ACTIONS = new Set([
   "ask_user",
   "finish",
   "stop",
+  // General browser actions.
+  "double_click",
+  "key_press",
+  "scroll",
+  "scroll_to",
+  "go_back",
+  "go_forward",
+  "navigate",
+  "switch_tab",
+  "open_tab",
+  "close_tab",
 ]);
+
+/** Keys the model may press. Anything else is rejected by validateAction. */
+const ALLOWED_KEYS = new Set([
+  "ENTER", "TAB", "ESCAPE", "ESC", "SPACE", "BACKSPACE", "DELETE",
+  "ARROWUP", "ARROWDOWN", "ARROWLEFT", "ARROWRIGHT",
+  "HOME", "END", "PAGEUP", "PAGEDOWN",
+]);
+
+const ALLOWED_DIRECTIONS = new Set(["up", "down", "left", "right"]);
+
+/** Only http(s) navigation. Blocks javascript:, data:, file: and friends. */
+function safeUrl(raw) {
+  try {
+    const url = new URL(String(raw));
+    return (url.protocol === "https:" || url.protocol === "http:") ? url.href : null;
+  } catch (_) {
+    return null;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // JSON Schema the AI must satisfy
@@ -53,6 +91,19 @@ const ACTION_SCHEMA = {
     question: {
       type: "string",
       description: "For ask_user: the question to present to the human.",
+    },
+    key: {
+      type: "string",
+      description: "For key_press: one of ENTER, TAB, ESCAPE, SPACE, BACKSPACE, DELETE, ARROWUP, ARROWDOWN, ARROWLEFT, ARROWRIGHT, HOME, END, PAGEUP, PAGEDOWN.",
+    },
+    direction: {
+      type: "string",
+      enum: ["up", "down", "left", "right"],
+      description: "For scroll: which way to scroll.",
+    },
+    amount: {
+      type: "number",
+      description: "For scroll: distance in pixels (50-5000).",
     },
     reason: {
       type: "string",
@@ -158,6 +209,33 @@ export function validateAction(raw, fallbackReason = "invalid AI response") {
     safe.confidence = Math.max(0, Math.min(1, raw.confidence));
   }
 
+  // key_press: only named keys from the allow-list.
+  if (action === "key_press") {
+    const key = String(raw.key ?? raw.value ?? "").toUpperCase().trim();
+    if (!ALLOWED_KEYS.has(key)) {
+      return { action: "stop", reason: `unsupported key "${raw.key ?? raw.value}" — ${fallbackReason}` };
+    }
+    safe.key = key;
+  }
+
+  // scroll: bounded direction and distance.
+  if (action === "scroll") {
+    const dir = String(raw.direction || "down").toLowerCase().trim();
+    safe.direction = ALLOWED_DIRECTIONS.has(dir) ? dir : "down";
+    const amount = Number(raw.amount ?? raw.value ?? 600);
+    safe.amount = Number.isFinite(amount) ? Math.min(5000, Math.max(50, Math.abs(amount))) : 600;
+  }
+
+  // navigate / open_tab: http(s) only. A javascript: or data: URL is code
+  // execution by another name, so an unsafe URL fails the whole action.
+  if (action === "navigate" || action === "open_tab") {
+    const url = safeUrl(raw.value ?? raw.url);
+    if (!url) {
+      return { action: "stop", reason: `unsafe or missing URL for ${action} — ${fallbackReason}` };
+    }
+    safe.value = url;
+  }
+
   return safe;
 }
 
@@ -167,21 +245,52 @@ export function validateAction(raw, fallbackReason = "invalid AI response") {
 
 function buildSystemPrompt() {
   return [
-    "You are an AI agent controlling a job application form on behalf of a candidate.",
-    "You receive a UISnapshot describing the current state of the application UI,",
-    "and a CandidateContext with information about the candidate.",
+    "You are a browser agent operating a web page on behalf of a job candidate.",
+    "You receive a UISnapshot describing the interactive controls currently visible,",
+    "a CandidateContext describing the candidate, and sometimes a screenshot of the",
+    "viewport. Your task is to decide the SINGLE NEXT ACTION to take.",
     "",
-    "Your task is to decide the SINGLE NEXT ACTION to take.",
+    "Available actions:",
+    "  click, double_click, type, key_press, scroll, scroll_to, select, check,",
+    "  uncheck, upload, go_back, go_forward, navigate, switch_tab, open_tab,",
+    "  close_tab, wait, ask_user, finish, stop",
     "",
-    "Rules:",
-    "1. Only use information from CandidateContext. NEVER invent or assume candidate data.",
-    "2. If the answer to a required field is not in CandidateContext, return ask_user.",
-    "3. Return ONLY valid JSON matching the action schema. No code, no selectors, no explanations outside the JSON.",
-    "4. Use element IDs from the snapshot (e.g. element_1). Never write CSS selectors or XPaths.",
-    "5. Prefer deterministic answers: if noticePeriodDays=0 matches '0 - (Immediate Joiner)', select it.",
-    "6. Never fabricate answers for visa, disability, criminal, or demographic questions — always ask_user.",
-    "7. If the application appears complete (applied marker visible), return finish.",
-    "8. If a CAPTCHA or security challenge is detected, return stop.",
+    "Addressing the page:",
+    "1. Refer to controls ONLY by the element IDs in the snapshot (e.g. element_1).",
+    "   Never write CSS selectors, XPaths, JavaScript, or coordinates.",
+    "2. The snapshot lists every visible interactive control, not just form fields.",
+    "   An element may have no visible text but still be the right target — check",
+    "   its ariaLabel and title. `<button aria-label=\"Easy Apply\">` is an Apply button.",
+    "3. applyCandidates ranks controls that look like they start or advance an",
+    "   application. It is a hint, not an instruction: a control may be the right",
+    "   one even if it is not listed, and wording varies ('Start application',",
+    "   'Get started', 'Continue application', 'Apply now').",
+    "",
+    "Choosing an option:",
+    "4. A dropdown has `options` (a list of strings): select it with",
+    "   { action: 'select', target: <the dropdown's id>, value: '<option text>' }.",
+    "   A radio group has `radioOptions` (objects with their own id and label):",
+    "   select it with { action: 'select', target: <the group's id>, value: '<label>' },",
+    "   or by targeting one option's id directly. Always name the option you want —",
+    "   omitting value selects the first one.",
+    "",
+    "Answering questions:",
+    "5. Only use information from CandidateContext. NEVER invent candidate data.",
+    "6. If a required answer is not in CandidateContext, return ask_user.",
+    "7. Never fabricate answers for visa, disability, criminal, or demographic",
+    "   questions — always ask_user.",
+    "",
+    "Judging progress:",
+    "8. If lastFailure is present, the action described there was executed but the",
+    "   website did not react. Do NOT simply repeat it. Choose a different control,",
+    "   scroll to reveal more of the page, or ask_user.",
+    "9. Return finish ONLY when the page shows an explicit confirmation that the",
+    "   application was submitted. A dialog opening, a step advancing, or a button",
+    "   changing is progress, not submission.",
+    "10. If a CAPTCHA, robot check, or security challenge is present, return stop.",
+    "    Never attempt to solve or work around one.",
+    "",
+    "Return ONLY valid JSON matching the action schema.",
   ].join("\n");
 }
 
@@ -192,12 +301,74 @@ function buildSystemPrompt() {
 /**
  * Ask the AI what action to take next given the current UISnapshot.
  *
- * @param {object}   snapshot    UISnapshot from naukriObserver.observe()
+ * @param {object}   snapshot    UISnapshot from an adapter's observe()
  * @param {object}   profile     Full candidate profile from storage
  * @param {Function} askJSON     The askJSON function from the LLM router
  * @returns {Promise<object>}    AgentAction
  */
-export async function decideAction(snapshot, profile, askJSON) {
+/**
+ * Strip a snapshot down to what the model needs.
+ *
+ * The raw snapshot carries fingerprints and per-element bookkeeping that cost
+ * tokens without helping the decision. Rects are kept — the model uses them to
+ * reason about layout — but rounded, and empty fields are dropped entirely.
+ *
+ * @param {object} snapshot
+ * @returns {object} compact snapshot
+ */
+export function compactSnapshot(snapshot) {
+  if (!snapshot) return snapshot;
+
+  const elements = (snapshot.elements || snapshot.controls || []).map((el) => {
+    const out = { id: el.id, tag: el.tag, role: el.role };
+    if (el.type) out.type = el.type;
+    if (el.text) out.text = String(el.text).slice(0, 160);
+    if (el.ariaLabel) out.ariaLabel = el.ariaLabel;
+    if (el.title) out.title = el.title;
+    if (el.placeholder) out.placeholder = el.placeholder;
+    if (el.name) out.name = el.name;
+    if (el.value) out.value = String(el.value).slice(0, 160);
+    if (el.selectedText) out.selectedText = el.selectedText;
+    // A dropdown's options are plain strings; a radio group's are objects with
+    // their own element IDs. Emitting both under one key invites the model to
+    // address a radio group the way it addresses a dropdown, which used to
+    // select the wrong option. Keep the two shapes under distinct names.
+    if (el.options) {
+      if (el.role === "radiogroup") out.radioOptions = el.options;
+      else out.options = el.options;
+    }
+    if (el.checked != null) out.checked = el.checked;
+    if (el.disabled) out.disabled = true;
+    if (el.rect) out.rect = el.rect;
+    return out;
+  });
+
+  const out = {
+    page: snapshot.page,
+    elements,
+  };
+  if (snapshot.questions?.length) out.questions = snapshot.questions;
+  if (snapshot.applyCandidates?.length) out.applyCandidates = snapshot.applyCandidates;
+  if (snapshot.errors?.length) out.errors = snapshot.errors;
+  if (snapshot.successIndicators?.length) out.successIndicators = snapshot.successIndicators;
+  if (snapshot.messages?.length) out.messages = snapshot.messages;
+  if (snapshot.loading) out.loading = true;
+  return out;
+}
+
+/**
+ * Ask the AI what action to take next.
+ *
+ * @param {object}   snapshot  UISnapshot from an adapter's observe()
+ * @param {object}   profile   Full candidate profile from storage
+ * @param {Function} askJSON   The askJSON function from the LLM router
+ * @param {object}   [opts]
+ * @param {string}   [opts.screenshot]   data: URL of the viewport, when the DOM
+ *                                       alone was insufficient
+ * @param {object}   [opts.lastFailure]  The action that produced no effect
+ * @returns {Promise<object>} AgentAction
+ */
+export async function decideAction(snapshot, profile, askJSON, opts = {}) {
   if (!snapshot || !askJSON) {
     return { action: "stop", reason: "decideAction called without snapshot or askJSON" };
   }
@@ -213,23 +384,46 @@ export async function decideAction(snapshot, profile, askJSON) {
   }
 
   const candidateContext = buildCandidateContext(profile);
-  const userPrompt = [
+  const parts = [
     "UISnapshot:",
-    JSON.stringify(snapshot, null, 2),
+    JSON.stringify(compactSnapshot(snapshot), null, 2),
     "",
     "CandidateContext:",
     JSON.stringify(candidateContext, null, 2),
-    "",
-    "Decide the single next action. Return JSON only.",
-  ].join("\n");
+  ];
+
+  // Feedback from a previous action the website ignored. Without this the
+  // model has no way to know its last choice was rejected and will repeat it.
+  if (opts.lastFailure) {
+    parts.push(
+      "",
+      "PreviousActionFailed:",
+      JSON.stringify(opts.lastFailure, null, 2),
+      "The action above was executed but the website did not react to it.",
+      "Choose a different approach.",
+    );
+  }
+
+  if (opts.screenshot) {
+    parts.push(
+      "",
+      "A screenshot of the current viewport is attached. Use it when the DOM",
+      "snapshot is ambiguous — a control visible in the image but missing from",
+      "the snapshot is still real, and you can scroll to bring it into reach.",
+    );
+  }
+
+  parts.push("", "Decide the single next action. Return JSON only.");
 
   let raw;
   try {
     raw = await askJSON({
       task: "uiAction",
       system: buildSystemPrompt(),
-      user: userPrompt,
+      user: parts.join("\n"),
       schema: ACTION_SCHEMA,
+      // Reuses the existing multimodal `file` convention of the LLM router.
+      file: opts.screenshot || undefined,
     });
   } catch (err) {
     // Provider error → wait and let the caller retry

@@ -76,20 +76,35 @@ async function openApplicationDrawer() {
               "The job may already be applied, require a fresh login, or use an unsupported button flow.",
     };
   }
-  button.scrollIntoView({ block: "center", inline: "center" });
-  button.focus();
-  button.click();
+  // Try a DOM click first, then a real pointer sequence if Naukri ignores it.
+  // A click that JavaScript accepted is not the same as one the site acted on.
+  const pointer = globalThis.__autoApplyPointer;
 
-  // Poll for any of the three success states: submitted, chatbot drawer,
-  // or radio/questionnaire panel.  48 × 250 ms = 12 s.
-  for (let attempt = 0; attempt < 48; attempt++) {
+  /** Has any of the three success states appeared? */
+  function opened() {
     if (naukriApplicationSubmitted()) return { ok: true, submitted: true };
     if (naukriVisible(Q().drawer)) return { ok: true, mode: "chatbot" };
-    const modeNow = detectApplicationMode();
-    if (modeNow === "agent") return { ok: true, mode: "agent" };
-    const anomaly = naukriScrape.checkAnomaly();
-    if (anomaly) return { ok: false, blocked: true, reason: anomaly };
-    await sleep(250);
+    if (detectApplicationMode() === "agent") return { ok: true, mode: "agent" };
+    return null;
+  }
+
+  const methods = pointer
+    ? [() => pointer.domClick(button), () => pointer.pointerClick(button)]
+    : [async () => { button.scrollIntoView({ block: "center" }); button.focus(); button.click(); }];
+
+  for (let m = 0; m < methods.length; m++) {
+    if (m > 0) console.debug("[EXECUTOR] Apply DOM click had no effect — attempting pointer click");
+    await methods[m]();
+
+    // Poll for a real state transition. 24 × 250 ms = 6 s per method, so the
+    // overall budget stays the 12 s the caller expects.
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const state = opened();
+      if (state) return state;
+      const anomaly = naukriScrape.checkAnomaly();
+      if (anomaly) return { ok: false, blocked: true, reason: anomaly };
+      await sleep(250);
+    }
   }
 
   // Nothing appeared — try to diagnose why.

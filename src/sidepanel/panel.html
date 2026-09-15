@@ -216,6 +216,22 @@
   </div>
   <button class="act ghost" id="clearHalt">Clear halt</button>
   <div id="log" class="meta" style="margin-top:10px"></div>
+
+  <h3 style="margin-top:16px">Interaction diagnostics</h3>
+  <p class="meta">
+    Every click records whether the website actually reacted. Turn on debug
+    capture to also store before/after screenshots for interactions that
+    failed — useful when a button looks right but the page ignores it.
+  </p>
+  <label style="display:flex;align-items:center;gap:6px">
+    <input id="debugMode" type="checkbox" style="width:auto">
+    Capture screenshots for failed interactions
+  </label>
+  <div class="row" style="margin-top:6px">
+    <button class="act ghost" id="refreshDiagnostics">Show recent interactions</button>
+    <button class="act ghost" id="clearDiagnostics">Clear</button>
+  </div>
+  <div id="diagnostics" class="meta" style="margin-top:8px"></div>
 </section>
 
 <script type="module" src="panel.js"></script>

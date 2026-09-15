@@ -9,12 +9,21 @@ export const defaults = {
   maxTokens: 4096,
 };
 
-export async function askJSON({ apiKey, model, system, user, schema, maxTokens }) {
+export async function askJSON({ apiKey, model, system, user, schema, maxTokens, file }) {
+  // `file` carries an optional image (e.g. a viewport screenshot) as
+  // { mime, b64 }. Text-only calls pass a plain string as before.
+  const content = file?.b64
+    ? [
+        { type: "image", source: { type: "base64", media_type: file.mime || "image/png", data: file.b64 } },
+        { type: "text", text: user },
+      ]
+    : user;
+
   const body = {
     model: model || defaults.model,
     max_tokens: maxTokens || defaults.maxTokens,
     system,
-    messages: [{ role: "user", content: user }],
+    messages: [{ role: "user", content }],
     output_config: {
       format: { type: "json_schema", schema },
     },

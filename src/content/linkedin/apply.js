@@ -1,71 +1,71 @@
-// LinkedIn Easy Apply adapter — AI agent-loop shim.
+// LinkedIn Easy Apply adapter — entry point.
 //
-// The old approach (hard-coded DOM walking + per-field RESOLVE_ANSWER) has
-// been replaced by the Claude computer-use style AI agent loop. The agent:
+// Owns the steps that happen before the agent loop takes over:
+//   - anomaly / security check
+//   - external-apply detection (handoff, not automation)
+//   - opening the Easy Apply dialog, VERIFYING that it actually opened
+//   - delegating the multi-step form to linkedinAgentLoop
 //
-//   1. Calls linkedinObserver.observe() to get a compact UISnapshot
-//   2. Sends AI_DECIDE_ACTION to the service worker
-//   3. Receives a validated JSON action { click | type | select | … }
-//   4. Calls linkedinExecutor.executeAction() which flashes the highlight
-//      ring, performs the action, and verifies the result
-//   5. Loops until submitted / stopped / waiting-for-user / maxTurns
-//
-// This file is the entry point called by main.js; it still owns:
-//   - External-apply detection (handoff, not automation)
-//   - Initial Easy Apply button click to open the dialog
-//   - Delegating the multi-step form to linkedinAgentLoop.runAgentLoop()
+// The dialog is opened through the shared openApplication helper rather than a
+// bare `button.click()`. That matters: LinkedIn is a React SPA, and a
+// programmatic click on the Easy Apply button is sometimes accepted by the DOM
+// and ignored by the application. The helper verifies the dialog appeared and
+// escalates to a real pointer sequence when it did not.
 
-/* global LINKEDIN_SEL, linkedinCheckAnomaly, linkedinVisible,
-          linkedinAgentLoop */
+/* global LINKEDIN_SEL, linkedinCheckAnomaly, linkedinObserver, linkedinAgentLoop */
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+(function () {
+  if (globalThis.linkedinApply) return; // idempotent guard
 
-function dialog() {
-  return [...document.querySelectorAll(LINKEDIN_SEL.form.dialog)]
-    .filter(linkedinVisible).at(-1) || null;
-}
+  const loop = () => globalThis.__autoApplyAgentLoopCore;
+  const logic = () => globalThis.__autoApplyInteractionCore;
 
-/**
- * Main apply entry point.
- *
- * @param {object} [_job]  Job metadata (not used by the agent loop; kept for
- *                         API compatibility with main.js callers).
- * @returns {Promise<object>} { submitted, … }
- */
-async function apply(_job) {
-  // 1. Anomaly check before touching anything
-  const anomaly = linkedinCheckAnomaly();
-  if (anomaly) return { submitted: false, blocked: true, reason: anomaly };
+  /**
+   * Main apply entry point.
+   *
+   * @param {object} [_job]  Job metadata, kept for main.js API compatibility.
+   * @returns {Promise<object>} { submitted, applicationStatus, ... }
+   */
+  async function apply(_job) {
+    // 1. Never act past a security challenge.
+    const anomaly = linkedinCheckAnomaly();
+    if (anomaly) return { submitted: false, blocked: true, stopped: true, reason: anomaly };
 
-  // 2. External-apply guard — we do not automate third-party ATS pages
-  if (LINKEDIN_SEL.job.externalApply()) {
-    return {
-      submitted: false,
-      external: true,
-      reason: "External company application — automatic submission is not supported for this origin.",
-    };
-  }
-
-  // 3. Open the Easy Apply dialog if it's not already open
-  let root = dialog();
-  if (!root) {
-    const button = LINKEDIN_SEL.job.easyApply();
-    if (!button) {
-      return { submitted: false, reason: "No verified LinkedIn Easy Apply button found on this page." };
+    // 2. External company application — hand off rather than guess.
+    if (LINKEDIN_SEL.job.externalApply()) {
+      return {
+        submitted: false,
+        applicationStatus: logic().APPLICATION_STATUS.NOT_SUBMITTED,
+        external: true,
+        reason: "External company application — handing off to the generic browser adapter.",
+      };
     }
-    button.click();
-    // Wait up to 5 s for the dialog to appear
-    for (let wait = 0; wait < 20 && !root; wait++) {
-      await sleep(250);
-      root = dialog();
+
+    // 3. Open the Easy Apply dialog, if it is not already open.
+    if (!linkedinObserver.dialogRoot()) {
+      const snapshot = linkedinObserver.observe();
+      const opened = await loop().openApplication({
+        // LinkedIn's own Easy Apply locator is tried first as a hint; the
+        // observed apply-intent candidates are the fallback if it misses.
+        hint: () => LINKEDIN_SEL.job.easyApply(),
+        snapshot,
+        opened: () => Boolean(linkedinObserver.dialogRoot()),
+        settleMax: 3000,
+      });
+
+      if (!opened.opened) {
+        return {
+          submitted: false,
+          applicationStatus: logic().APPLICATION_STATUS.NOT_SUBMITTED,
+          reason: opened.reason || "The Easy Apply dialog did not open.",
+          tried: opened.tried || [],
+        };
+      }
     }
-  }
-  if (!root) {
-    return { submitted: false, reason: "Easy Apply dialog did not open within 5 seconds." };
+
+    // 4. Hand the multi-step form to the agent loop.
+    return linkedinAgentLoop.runAgentLoop();
   }
 
-  // 4. Hand off to the AI agent loop
-  return linkedinAgentLoop.runAgentLoop();
-}
-
-globalThis.linkedinApply = { apply };
+  globalThis.linkedinApply = { apply };
+}());

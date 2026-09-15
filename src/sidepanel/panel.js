@@ -486,5 +486,70 @@ $("clearHalt").onclick = async () => {
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-loadSetup(); loadGov(); renderStatus(); renderRun();
+// ---------------------------------------------------------------------------
+// Interaction diagnostics
+// ---------------------------------------------------------------------------
+
+/**
+ * Render the recent interaction records so a failed click can be diagnosed:
+ * what was clicked, by which method, and whether the site actually reacted.
+ */
+async function renderDiagnostics() {
+  const box = $("diagnostics");
+  if (!box) return;
+
+  const r = await chrome.runtime.sendMessage({ type: "GET_DIAGNOSTICS", limit: 25 });
+  if (!r?.ok) { box.textContent = "could not load diagnostics"; return; }
+
+  $("debugMode").checked = Boolean(r.debug);
+
+  if (!r.diagnostics.length) {
+    box.textContent = "No interactions recorded yet.";
+    return;
+  }
+
+  const rows = r.diagnostics.map((d) => {
+    const ok = d.result === "ACTION_CONFIRMED";
+    const when = new Date(d.timestamp || d.storedAt).toLocaleTimeString();
+    const retries = d.retryCount ? ` after ${d.retryCount} retr${d.retryCount === 1 ? "y" : "ies"}` : "";
+    const changes = d.attempts?.find((a) => a.changes?.length)?.changes?.join(", ");
+    return `<div style="margin-bottom:6px;padding-left:6px;border-left:2px solid ${ok ? "#2d7" : "#d55"}">
+      <div><strong>${esc(d.action)}</strong> "${esc(d.targetText || d.target || "")}"
+        via ${esc(d.method)}${esc(retries)}</div>
+      <div>${esc(d.result)}${changes ? ` — page changed: ${esc(changes)}` : ""}</div>
+      ${d.error ? `<div>${esc(d.error)}</div>` : ""}
+      <div>${esc(when)}${d.beforeState?.url ? ` · ${esc(d.beforeState.url)}` : ""}</div>
+    </div>`;
+  });
+
+  const captures = r.captures?.length
+    ? `<div style="margin-top:8px">Debug captures stored: ${r.captures.length}
+       (${r.captures.map((c) => esc(c.id)).join(", ")})</div>`
+    : "";
+
+  box.innerHTML = rows.join("") + captures;
+}
+
+if ($("debugMode")) {
+  $("debugMode").onchange = async (event) => {
+    await chrome.runtime.sendMessage({ type: "SET_DEBUG_MODE", debug: event.target.checked });
+    log(event.target.checked
+      ? "debug capture on — screenshots will be stored for failed interactions"
+      : "debug capture off");
+  };
+}
+
+if ($("refreshDiagnostics")) {
+  $("refreshDiagnostics").onclick = renderDiagnostics;
+}
+
+if ($("clearDiagnostics")) {
+  $("clearDiagnostics").onclick = async () => {
+    await chrome.runtime.sendMessage({ type: "CLEAR_DIAGNOSTICS" });
+    log("diagnostics cleared");
+    renderDiagnostics();
+  };
+}
+
+loadSetup(); loadGov(); renderStatus(); renderRun(); renderDiagnostics();
 setInterval(() => { renderStatus(); renderRun(); }, 5000);

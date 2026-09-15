@@ -340,3 +340,102 @@ Key constraints enforced in code:
 - A new `uiAction` LLM task route in `storage.js` allows independent provider and model configuration for UI decisions.
 
 `npm test` now runs 27 tests (7 original + 20 new in `tests/ui-agent.test.js`); all pass.
+
+### Reliable browser interaction increment (2026-09-15)
+
+The agent loop was reliable at *executing* actions and unreliable at knowing
+whether the website had *accepted* them. Three near-identical observers,
+executors and loops had each drifted, and all three reported
+`el.click()` returning without throwing as success:
+
+```js
+el.click();
+return { success: true, verified: document.contains(el) };   // before
+```
+
+The loop is unchanged in shape. What changed is that every step now compares
+observed page state before and after the action.
+
+#### Shared cores replace three copies
+
+| File | Role |
+|---|---|
+| `src/lib/interaction-core.js` | Pure, DOM-free verdict logic: apply-intent ranking, page-state diffing, click classification, retry strategy, stale detection, submission gating, security policy. Unit-testable under `node --test`. |
+| `src/content/shared/interaction-core-bridge.js` | The same logic as a classic script, since content scripts cannot `import`. A test asserts the two copies agree, so they cannot drift. |
+| `src/content/shared/observer-core.js` | General element observation, element metadata, logical-target registry and re-resolution, page fingerprints. |
+| `src/content/shared/pointer-actions.js` | DOM click, full pointer sequence, keyboard, scrolling. |
+| `src/content/shared/executor-core.js` | Verified actions with DOM→pointer escalation and diagnostics. |
+| `src/content/shared/agent-loop-core.js` | The observe → decide → execute → verify → reassess cycle, parameterised by a platform adapter. |
+| `src/content/shared/diagnostics.js` | Structured per-interaction records; screenshot capture on failure when debugging. |
+| `src/lib/debug-store.js` | Worker-side persistence of diagnostics and debug captures. |
+
+Naukri, LinkedIn and generic are now **adapters** (~40–150 lines each) that
+supply platform hints — which subtree to observe, the authoritative completion
+check, anomaly rules — and nothing else. The core browser agent works without
+them. Net change: **−1377 lines** across the rewritten files.
+
+#### Action results are no longer binary
+
+`ACTION_EXECUTED` (JavaScript ran) is now distinct from `ACTION_CONFIRMED`
+(the page changed), `ACTION_NO_EFFECT` (it did not), `ACTION_FAILED` and
+`ACTION_STALE`. A click escalates DOM click → pointer sequence → re-resolve +
+pointer, bounded by `MAX_CLICK_RETRIES`, then hands back to the model with the
+failure described and a screenshot attached.
+
+#### Behavioural facts added (do not regress)
+
+1. `element_N` is a **logical** target. Before every interaction the registry
+   re-checks the node and, if a rerender replaced it, re-finds it by accessible
+   name, role, tag and type. Position is never an identity test — a scrolled
+   button is the same button.
+2. Observers no longer filter controls by a job-application keyword list. That
+   filter hid "Start application", "Get started" and every unlabelled
+   `aria-label` button from the model. Apply intent is now a **ranking hint**
+   (`applyCandidates`) alongside the full element list.
+3. `submitted: true` requires the adapter's own check or an explicit
+   confirmation message. A dialog opening, a step advancing or the model
+   returning `finish` all yield `APPLICATION_STATUS_UNKNOWN`.
+4. Pointer interaction exists to drive ordinary controls that ignore
+   `.click()`. It is **never** used against a CAPTCHA or challenge: the
+   security gate runs before every action and stops the run.
+5. Screenshots are sent to the model only when the DOM was insufficient
+   (target missing, click had no effect, page ambiguous), never every turn.
+6. `navigate` / `open_tab` accept http(s) only, validated in both `ui-agent.js`
+   and the worker. A `javascript:` URL is code execution by another name.
+
+#### Action vocabulary
+
+All ten original actions are retained. Added: `double_click`, `key_press`
+(allow-listed keys), `scroll`, `scroll_to`, `go_back`, `go_forward`,
+`navigate`, `switch_tab`, `open_tab`, `close_tab`. Still absent by design:
+any action that executes a model-supplied string as code.
+
+#### False-confirmation traps closed during review
+
+An internal review of this increment found several ways the system could still
+claim success it had not earned. Each now has a regression test:
+
+| Defect | Why it mattered |
+|---|---|
+| `hasSubmissionEvidence` matched whole-page text | A sidebar rail reading "Application sent 2 days ago" for a *different* job, or a step counter reading "Application complete 3 of 5", marked the current job submitted. Patterns are now anchored and disqualified by nearby context. |
+| Any text change confirmed a click | A ticking relative timestamp or a lazy-loaded rail "confirmed" a dead click. A **structural** change (url, title, modal, control/field counts, errors) is now required; the fingerprint also strips self-changing text. |
+| `select` on a radio group ignored `value` | A group is published as one element whose id is its *first* option, so answering "No" to a visa question selected "Yes" — and reported `ACTION_CONFIRMED`. `select` now resolves the requested option by label or value. |
+| `type` on a `<select>` threw `Illegal invocation` | Aborted the entire run. `type` now routes selects to `select` and rejects untypeable elements; `dispatch` is also wrapped so no executor throw can end a job. |
+| `key_press` returned `success: true` on no effect | Also reset the stuck-loop counter, letting a model alternate click/key_press until `maxTurns`. Now `ACTION_NO_EFFECT`; `wait` is marked neutral so it neither counts as progress nor as failure. |
+| Two unlabelled fields re-resolved to each other | Typed into the wrong field and verified it. Nameless controls now require positional identity. |
+| `double_click` was executed as a single click | Silently wrong for any control needing a real double click. |
+| Diagnostics walked and *registered* elements | Leaked detached nodes into the live registry on every failure; now a read-only `describeAll`. |
+| Concurrent diagnostic writes clobbered each other | Records were lost during exactly the burst of failures they exist to explain; writes are now serialized. |
+
+#### Tests
+
+`npm test` runs **196** tests (52 original + 144 new), all passing:
+`tests/interaction-core.test.js` (verdict logic), `tests/browser-actions.test.js`
+(schema and safety), `tests/executor-dom.test.js`, `tests/adapters.test.js` and
+`tests/agent-loop.test.js` (the real content scripts against a small DOM
+harness in `tests/helpers/`, no jsdom dependency).
+
+`tests/adapters.test.js` loads each adapter through the **manifest's own**
+script list, so a load-order or missing-file regression fails the suite.
+`tests/interaction-core.test.js` asserts the classic-script bridge and the ES
+module agree, so the two copies of the verdict logic cannot drift.

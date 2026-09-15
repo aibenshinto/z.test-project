@@ -7,7 +7,16 @@ export const defaults = {
   maxTokens: 4096,
 };
 
-export async function askJSON({ apiKey, model, system, user, schema, maxTokens }) {
+export async function askJSON({ apiKey, model, system, user, schema, maxTokens, file }) {
+  // `file` carries an optional image (e.g. a viewport screenshot) as
+  // { mime, b64 }. Text-only calls pass a plain string as before.
+  const userContent = file?.b64
+    ? [
+        { type: "text", text: user },
+        { type: "image_url", image_url: { url: `data:${file.mime || "image/png"};base64,${file.b64}` } },
+      ]
+    : user;
+
   const res = await fetch(ENDPOINT, {
     method: "POST",
     headers: {
@@ -19,7 +28,7 @@ export async function askJSON({ apiKey, model, system, user, schema, maxTokens }
       max_tokens: maxTokens || defaults.maxTokens,
       messages: [
         { role: "system", content: system },
-        { role: "user", content: user },
+        { role: "user", content: userContent },
       ],
       response_format: {
         type: "json_schema",
