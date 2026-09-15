@@ -487,6 +487,133 @@ const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 // ---------------------------------------------------------------------------
+// Agent takeover — the agent works the tab the user is already looking at
+// ---------------------------------------------------------------------------
+
+/** The tab the user is looking at, which is the one the agent takes over. */
+async function activeTab() {
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  return tab || null;
+}
+
+/** Ask the page what pressing Take over would do, so the button can say so. */
+async function renderTakeoverContext() {
+  const box = $("takeoverContext");
+  if (!box) return;
+
+  const tab = await activeTab();
+  if (!tab?.id) { box.textContent = "No active tab."; return; }
+
+  let probe = null;
+  try {
+    probe = await chrome.tabs.sendMessage(tab.id, { type: "TAKEOVER_PROBE" });
+  } catch (_) {
+    // The content script is not in this tab — a chrome:// page, the web store,
+    // or a tab opened before the extension was loaded.
+    box.innerHTML = `<span style="color:var(--err)">The agent cannot run on this page.</span>` +
+      ` Open a job search on a normal website and reload it.`;
+    return;
+  }
+
+  if (!probe?.ok) { box.textContent = "Could not read this page."; return; }
+
+  const host = (() => { try { return new URL(probe.url).hostname; } catch (_) { return probe.url; } })();
+  box.innerHTML = probe.onResultsPage
+    ? `Ready on <b>${esc(host)}</b> — <b>${probe.jobCount}</b> job${probe.jobCount === 1 ? "" : "s"} visible.`
+    : `On <b>${esc(host)}</b>. No results list detected; the agent will apply to this single job.`;
+}
+
+function setTakeoverRunning(running) {
+  $("takeoverStart").hidden = running;
+  $("takeoverPause").hidden = !running;
+  $("takeoverStop").hidden = !running;
+  $("takeoverResume").hidden = true;
+}
+
+if ($("takeoverStart")) {
+  $("takeoverStart").onclick = async () => {
+    const tab = await activeTab();
+    if (!tab?.id) return log("no active tab");
+
+    setTakeoverRunning(true);
+    $("takeoverStatus").textContent = "Agent has taken over the page…";
+    log(`agent taking over: ${tab.title || tab.url}`);
+
+    try {
+      await chrome.tabs.sendMessage(tab.id, {
+        type: "SET_CURSOR_VISIBLE",
+        visible: $("showCursor").checked,
+      }).catch(() => {});
+
+      const result = await chrome.tabs.sendMessage(tab.id, {
+        type: "TAKEOVER_START",
+        options: {
+          maxJobs: Number($("maxJobs").value) || 25,
+          maxPages: Number($("maxPages").value) || 3,
+        },
+      });
+
+      if (!result?.ok) {
+        $("takeoverStatus").textContent = `Stopped: ${result?.error || "unknown error"}`;
+      } else {
+        const parts = [`${result.appliedCount} applied`, `${result.skippedCount} skipped`];
+        if (result.reason) parts.push(esc(result.reason));
+        $("takeoverStatus").innerHTML =
+          `<b>${parts.slice(0, 2).join(", ")}</b><div>${esc(result.reason || "")}</div>` +
+          renderJobList(result.applied, "Applied") +
+          renderJobList(result.skipped, "Not submitted");
+      }
+    } catch (err) {
+      $("takeoverStatus").textContent =
+        `The page stopped responding: ${String(err?.message || err)}. ` +
+        `If it navigated away, reload and take over again.`;
+    } finally {
+      setTakeoverRunning(false);
+      renderDiagnostics();
+    }
+  };
+}
+
+function renderJobList(jobs, heading) {
+  if (!jobs?.length) return "";
+  const rows = jobs.slice(0, 25).map((j) =>
+    `<div>· ${esc(j.title)}${j.company ? ` — ${esc(j.company)}` : ""}` +
+    `${j.reason ? `<br><span style="opacity:.75">${esc(j.reason)}</span>` : ""}</div>`).join("");
+  return `<div style="margin-top:6px"><b>${esc(heading)}</b>${rows}</div>`;
+}
+
+for (const [id, type] of [["takeoverStop", "TAKEOVER_STOP"], ["takeoverPause", "TAKEOVER_PAUSE"], ["takeoverResume", "TAKEOVER_RESUME"]]) {
+  if (!$(id)) continue;
+  $(id).onclick = async () => {
+    const tab = await activeTab();
+    if (!tab?.id) return;
+    await chrome.tabs.sendMessage(tab.id, { type }).catch(() => {});
+    if (type === "TAKEOVER_PAUSE") { $("takeoverPause").hidden = true; $("takeoverResume").hidden = false; }
+    if (type === "TAKEOVER_RESUME") { $("takeoverPause").hidden = false; $("takeoverResume").hidden = true; }
+    if (type === "TAKEOVER_STOP") { $("takeoverStatus").textContent = "Stopping after the current step…"; }
+  };
+}
+
+if ($("showCursor")) {
+  $("showCursor").onchange = async (event) => {
+    const tab = await activeTab();
+    if (!tab?.id) return;
+    await chrome.tabs.sendMessage(tab.id, {
+      type: "SET_CURSOR_VISIBLE", visible: event.target.checked,
+    }).catch(() => {});
+  };
+}
+
+// Live progress from the agent as it works.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type !== "TAKEOVER_PROGRESS") return;
+  const box = $("takeoverStatus");
+  if (!box) return;
+  const job = msg.job ? ` — ${esc(String(msg.job).slice(0, 60))}` : "";
+  box.innerHTML = `<b>${esc(msg.phase || "")}</b>${job}<div>${esc(msg.note || "")}</div>`;
+});
+
+// ---------------------------------------------------------------------------
 // Interaction diagnostics
 // ---------------------------------------------------------------------------
 
@@ -551,5 +678,11 @@ if ($("clearDiagnostics")) {
   };
 }
 
-loadSetup(); loadGov(); renderStatus(); renderRun(); renderDiagnostics();
+loadSetup(); loadGov(); renderStatus(); renderRun(); renderDiagnostics(); renderTakeoverContext();
 setInterval(() => { renderStatus(); renderRun(); }, 5000);
+
+// Keep the takeover context in step with whatever the user is looking at.
+chrome.tabs.onActivated.addListener(() => renderTakeoverContext());
+chrome.tabs.onUpdated.addListener((_id, change, tab) => {
+  if (change.status === "complete" && tab.active) renderTakeoverContext();
+});

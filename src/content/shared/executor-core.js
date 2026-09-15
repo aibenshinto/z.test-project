@@ -54,7 +54,11 @@
    * @param {number} [opts.min=350]   Always wait at least this long
    * @param {number} [opts.max=2000]  Give up waiting after this long
    */
-  async function waitForSettle(before, { min = 350, max = 2000 } = {}) {
+  async function waitForSettle(before, { min, max = 2000 } = {}) {
+    // The floor gives a framework time to start rendering before we look, but
+    // it must never exceed the caller's overall budget — otherwise a short
+    // settleMax still costs the full default wait.
+    if (min == null) min = Math.min(350, Math.round(max / 2));
     const started = Date.now();
     await sleep(min);
 
@@ -165,9 +169,10 @@
       const before = obs().fingerprint();
       await highlight(el, "click", 350);
 
-      const exec = method === "double_click" ? await ptr().doubleClick(el)
-        : method === "dom_click" ? await ptr().domClick(el)
-        : await ptr().pointerClick(el);
+      const note = `Clicking "${(meta.text || meta.ariaLabel || "control").slice(0, 60)}"`;
+      const exec = method === "double_click" ? await ptr().doubleClick(el, { note })
+        : method === "dom_click" ? await ptr().domClick(el, { note })
+        : await ptr().pointerClick(el, { note });
 
       if (!exec.executed) {
         attempts.push({ attempt, method, result: RESULT.FAILED, error: exec.error, rect: meta.rect });
@@ -317,6 +322,21 @@
 
     await highlight(el, "type", 350);
     await ptr().scrollIntoView(el);
+
+    // Move the visible cursor to the field so the user can follow the fill.
+    const fieldRect = el.getBoundingClientRect();
+    if (fieldRect.width > 0 && fieldRect.height > 0) {
+      const label = obs().describe(el);
+      // Cosmetic: a failing overlay must never stop the field being filled.
+      try {
+        await globalThis.__autoApplyCursor?.moveTo(
+          Math.round(fieldRect.x + fieldRect.width / 2),
+          Math.round(fieldRect.y + fieldRect.height / 2),
+          { note: `Filling "${(label.text || label.ariaLabel || "field").slice(0, 40)}"` },
+        );
+      } catch (_) { /* cosmetic only */ }
+    }
+
     el.focus?.({ preventScroll: true });
 
     if (el.isContentEditable) {

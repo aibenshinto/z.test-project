@@ -427,13 +427,72 @@ claim success it had not earned. Each now has a regression test:
 | Diagnostics walked and *registered* elements | Leaked detached nodes into the live registry on every failure; now a read-only `describeAll`. |
 | Concurrent diagnostic writes clobbered each other | Records were lost during exactly the burst of failures they exist to explain; writes are now serialized. |
 
+### Takeover mode increment (2026-09-15)
+
+The previous model was an unattended background worker: it read a stored job
+queue, opened its own tabs, applied, and closed them. The user could not watch
+it, and it applied to jobs it had scraped rather than the ones the user had
+just searched for.
+
+Takeover mode inverts that. The user signs in, runs the search they want, and
+presses **Take over**; the agent works down *that* page, in *that* tab, while
+the user watches.
+
+```
+you sign in and search                     (the agent never logs in for you)
+        ↓  press Take over
+walk the visible results                   results-walker.js
+        ↓
+open a job → find apply → fill → verify    takeover.js + the shared agent loop
+        ↓                                   (external ATS ⇒ generic adapter)
+back to the results → next job → next page
+```
+
+| File | Role |
+|---|---|
+| `src/content/shared/cursor.js` | The visible agent cursor: an arrow that glides to each target, a ripple on click, and a caption saying what the agent is doing. |
+| `src/content/shared/results-walker.js` | Finds job cards on whatever results page is open, opens them, and pages forward. Semantic (job-shaped links grouped into cards), not per-site selectors. |
+| `src/content/shared/takeover.js` | The run: walk results → open → apply → verify → return → next. Owns pacing, pause/stop, and progress reporting to the side panel. |
+
+**The cursor is a drawn overlay, not the OS pointer.** No browser API can move
+the real mouse, so — as with any in-page agent — what the user sees is an
+indicator following the same coordinates the synthetic pointer events use. It
+is `pointer-events: none`, hides itself during hit-testing, and every call into
+it is wrapped: a failing overlay must never break an interaction.
+
+**Manifest.** The shared cores and the generic adapter now run on
+`https://*/*`, with Naukri and LinkedIn adding their own blocks on top. A page
+therefore receives the union of the matching blocks — which is what
+`tests/adapters.test.js` composes, rather than assuming one block per host.
+Broad host access was a deliberate choice: the alternative, prompting per new
+company domain, interrupts the run at exactly the point the user is watching.
+
+**Adapters are chosen per page, not per run.** A Naukri result that redirects
+to a company ATS is driven by the generic adapter from that point on, because
+`adapterForCurrentPage()` is re-evaluated on every job.
+
+**New tabs.** A content script cannot see another tab, so when a job opens one
+the takeover asks the worker (`TAKEOVER_ADOPT_NEW_TAB`) to focus it, run the
+application there, and hand control back. The worker closes only the tab it
+adopted; the user's own tab is never closed.
+
+**Pacing is configurable** (`takeover.configure(...)`). Production keeps
+human-paced defaults; the tests collapse them, which is why the suite asserts
+sequencing rather than waiting out real budgets.
+
+A defect this work exposed: Naukri's `isComplete()` only recognised its own
+`appliedTag` markers, so a flow that renders a plain confirmation banner was
+recorded as a **skip despite having applied**. It now also accepts the shared
+submission evidence — which the sidebar/step-counter disqualifiers keep from
+firing on a results page. Both directions are covered by tests.
+
 #### Tests
 
-`npm test` runs **196** tests (52 original + 144 new), all passing:
+`npm test` runs **220** tests, all passing:
 `tests/interaction-core.test.js` (verdict logic), `tests/browser-actions.test.js`
-(schema and safety), `tests/executor-dom.test.js`, `tests/adapters.test.js` and
-`tests/agent-loop.test.js` (the real content scripts against a small DOM
-harness in `tests/helpers/`, no jsdom dependency).
+(schema and safety), `tests/executor-dom.test.js`, `tests/adapters.test.js`,
+`tests/agent-loop.test.js` and `tests/takeover.test.js` (the real content
+scripts against a small DOM harness in `tests/helpers/`, no jsdom dependency).
 
 `tests/adapters.test.js` loads each adapter through the **manifest's own**
 script list, so a load-order or missing-file regression fails the suite.

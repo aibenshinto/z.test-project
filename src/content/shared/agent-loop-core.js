@@ -432,7 +432,7 @@
    * @param {object} params.snapshot             Current snapshot
    * @param {() => boolean} params.opened        Did the application UI appear?
    */
-  async function openApplication({ hint, snapshot, opened, settleMax = 3000, budgetMs = 20000 }) {
+  async function openApplication({ hint, snapshot, opened, settleMax = 3000, budgetMs = 20000, openWaitMs = 3000 }) {
     const started = Date.now();
     const candidates = [];
 
@@ -470,12 +470,13 @@
 
       // The click may be CONFIRMED (page changed) while the change was not the
       // dialog we wanted — so the authoritative test is `opened()`.
-      for (let wait = 0; wait < 12; wait++) {
+      const deadline = Date.now() + openWaitMs;
+      while (Date.now() < deadline) {
         if (opened()) {
           log("[AGENT] Application UI opened");
           return { opened: true, via: cand, clickResult: result };
         }
-        await sleep(250);
+        await sleep(150);
       }
 
       log(`[AGENT] ${cand.id} did not open the application UI (${result.result})`);

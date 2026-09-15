@@ -187,6 +187,33 @@
 </section>
 
 <section id="tab-run" hidden>
+  <h3>Agent takeover</h3>
+  <p class="meta">
+    Sign in and search for jobs yourself, then press Take over. The agent works
+    down the results in this tab while you watch — you can stop it at any time.
+  </p>
+  <div id="takeoverContext" class="meta"></div>
+  <div class="row" style="margin-top:6px;flex-wrap:wrap;gap:6px">
+    <button class="act" id="takeoverStart">Take over this page</button>
+    <button class="act ghost" id="takeoverPause" hidden>Pause</button>
+    <button class="act ghost" id="takeoverResume" hidden>Resume</button>
+    <button class="act danger" id="takeoverStop" hidden>Stop</button>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <div><label>Max jobs</label><input id="maxJobs" type="number" value="25" min="1" max="100"></div>
+    <div><label>Max pages</label><input id="maxPages" type="number" value="3" min="1" max="20"></div>
+  </div>
+  <label style="display:flex;align-items:center;gap:6px;margin-top:6px">
+    <input id="showCursor" type="checkbox" checked style="width:auto">
+    Show the agent cursor on the page
+  </label>
+  <div id="takeoverStatus" class="meta" style="margin-top:8px"></div>
+
+  <h3 style="margin-top:18px">Background queue (advanced)</h3>
+  <p class="meta">
+    The original unattended mode: scrape jobs into a queue and let the worker
+    apply to them in its own tabs.
+  </p>
   <div id="currentRun" class="card muted">No active application.</div>
   <div id="actionRequired" class="card" hidden>
     <b>Action required</b>

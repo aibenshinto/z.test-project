@@ -17,36 +17,42 @@ const MANIFEST = JSON.parse(
   readFileSync(fileURLToPath(new URL("../manifest.json", import.meta.url)), "utf8"),
 );
 
-function manifestScripts(hostFragment) {
-  const block = MANIFEST.content_scripts.find((cs) =>
-    cs.matches.some((m) => m.includes(hostFragment)));
-  assert.ok(block, `no content_scripts block matches ${hostFragment}`);
-  return block.js;
+/**
+ * The scripts Chrome would inject into a page on this host.
+ *
+ * Several content_scripts blocks can match one page — the shared cores are
+ * declared for https://*<span/>/* and the platform adapters for their own hosts — so
+ * the effective script list is every matching block, in manifest order.
+ */
+function manifestScripts(hostname) {
+  const files = [];
+  for (const block of MANIFEST.content_scripts) {
+    if (block.matches.some((pattern) => matchesHost(pattern, hostname))) {
+      files.push(...block.js);
+    }
+  }
+  assert.ok(files.length, `no content_scripts block matches ${hostname}`);
+  return files;
 }
 
-const SHARED = [
-  "src/content/shared/highlight.js",
-  "src/content/shared/interaction-core-bridge.js",
-  "src/content/shared/observer-core.js",
-  "src/content/shared/pointer-actions.js",
-  "src/content/shared/diagnostics.js",
-  "src/content/shared/executor-core.js",
-  "src/content/shared/agent-loop-core.js",
-];
+/** Minimal match-pattern host test, enough for the patterns this manifest uses. */
+function matchesHost(pattern, hostname) {
+  const m = /^https?:\/\/([^/]+)\//.exec(pattern);
+  if (!m) return false;
+  const host = m[1];
+  if (host === "*") return true;
+  if (host.startsWith("*.")) {
+    const base = host.slice(2);
+    return hostname === base || hostname.endsWith("." + base);
+  }
+  return hostname === host;
+}
 
-const LINKEDIN = [
-  ...SHARED,
-  "src/content/linkedin/selectors.js",
-  "src/content/linkedin/observer.js",
-  "src/content/linkedin/executor.js",
-  "src/content/linkedin/agent-loop.js",
-];
-
-const GENERIC = [
-  ...SHARED,
-  "src/content/generic/observer.js",
-  "src/content/generic/executor.js",
-];
+// Derived from the manifest rather than hardcoded, so a change to the load
+// order or a renamed file fails these tests instead of silently diverging.
+const LINKEDIN = manifestScripts("www.linkedin.com");
+const NAUKRI = manifestScripts("www.naukri.com");
+const GENERIC = manifestScripts("boards.greenhouse.io");
 
 // ---------------------------------------------------------------------------
 // LinkedIn
@@ -134,7 +140,7 @@ test("LinkedIn opens an Easy Apply button that ignores .click() but honours poin
   // not progress. Loaded through the full manifest chain so apply.js and
   // main.js are exercised too.
   const e = createEnvironment({
-    scripts: MANIFEST.content_scripts.find((c) => c.matches[0].includes("linkedin")).js,
+    scripts: LINKEDIN,
     url: "https://www.linkedin.com/jobs/view/1",
   });
 
@@ -158,7 +164,7 @@ test("LinkedIn opens an Easy Apply button that ignores .click() but honours poin
 
 test("LinkedIn reports a genuinely unresponsive Apply button instead of claiming success", async () => {
   const e = createEnvironment({
-    scripts: MANIFEST.content_scripts.find((c) => c.matches[0].includes("linkedin")).js,
+    scripts: LINKEDIN,
     url: "https://www.linkedin.com/jobs/view/1",
   });
   // A button nothing listens to at all.
@@ -236,21 +242,40 @@ test("the generic observer reports a login wall as login, not as an application"
 // Naukri — loaded exactly as the manifest declares it
 // ---------------------------------------------------------------------------
 
-test("every content-script chain in the manifest loads in the declared order", () => {
-  for (const block of MANIFEST.content_scripts) {
-    const e = createEnvironment({ scripts: block.js, url: "https://www.naukri.com/job/1" });
+test("every host the manifest covers loads a complete agent", () => {
+  // The shared cores are declared for all sites and the adapters for their own
+  // hosts, so a real page gets the union. Each host must end up with a working
+  // agent — including an arbitrary company site, which is the external-ATS case.
+  for (const [hostname, url] of [
+    ["www.naukri.com", "https://www.naukri.com/job-listings-x-1"],
+    ["www.linkedin.com", "https://www.linkedin.com/jobs/view/1"],
+    ["boards.greenhouse.io", "https://boards.greenhouse.io/acme/jobs/1"],
+  ]) {
+    const e = createEnvironment({ scripts: manifestScripts(hostname), url });
     for (const core of [
       "__autoApplyInteractionCore", "__autoApplyObserverCore", "__autoApplyPointer",
       "__autoApplyExecutorCore", "__autoApplyAgentLoopCore", "__autoApplyDiagnostics",
+      "__autoApplyCursor", "__autoApplyResultsWalker", "__autoApplyTakeover",
     ]) {
-      assert.ok(e.sandbox[core], `${core} must be present for ${block.matches[0]}`);
+      assert.ok(e.sandbox[core], `${core} must be present on ${hostname}`);
     }
+    // Every page must have at least the generic adapter to fall back on.
+    assert.ok(e.sandbox.genericObserver, `genericObserver must be present on ${hostname}`);
   }
+});
+
+test("the agent runs on an arbitrary company site, not only the job boards", () => {
+  const e = createEnvironment({
+    scripts: manifestScripts("careers.acme.test"),
+    url: "https://careers.acme.test/apply/42",
+  });
+  assert.ok(e.sandbox.__autoApplyTakeover, "takeover must be available on any https site");
+  assert.equal(e.sandbox.__autoApplyTakeover.adapterForCurrentPage().name, "generic");
 });
 
 test("the Naukri adapter loads and exposes the API its callers use", () => {
   const e = createEnvironment({
-    scripts: manifestScripts("naukri"),
+    scripts: NAUKRI,
     url: "https://www.naukri.com/job-listings-x-1",
   });
 
@@ -263,7 +288,7 @@ test("the Naukri adapter loads and exposes the API its callers use", () => {
 
 test("Naukri reports state ready and ranks its Apply button", () => {
   const e = createEnvironment({
-    scripts: manifestScripts("naukri"),
+    scripts: NAUKRI,
     url: "https://www.naukri.com/job-listings-x-1",
   });
   e.make("button", { id: "apply-button", text: "Apply", rect: { x: 400, y: 200, width: 100, height: 40 } });
@@ -274,9 +299,29 @@ test("Naukri reports state ready and ranks its Apply button", () => {
   assert.equal(snapshot.applyCandidates[0].name, "Apply");
 });
 
+test("Naukri accepts a plain confirmation banner, not only its own markers", () => {
+  // Some Naukri flows render a confirmation without the appliedTag markers.
+  // Missing it made the agent report a successful application as a skip.
+  const e = createEnvironment({ scripts: NAUKRI, url: "https://www.naukri.com/job-listings-x-1" });
+  e.make("h1", { text: "Application submitted", rect: { width: 400, height: 30 } });
+
+  assert.equal(e.sandbox.naukriObserver.isComplete(), true);
+  assert.equal(e.sandbox.naukriObserver.observe().page.applicationState, "done");
+});
+
+test("a Naukri results page is never mistaken for a completed application", () => {
+  // The guard on the above: whole-page text on a results page contains other
+  // jobs' statuses, which must not read as this application being submitted.
+  const e = createEnvironment({ scripts: NAUKRI, url: "https://www.naukri.com/python-jobs" });
+  e.make("div", { text: "Recommended jobs", rect: { width: 300, height: 24 } });
+  e.make("div", { text: "Application sent 2 days ago", rect: { width: 300, height: 24 } });
+
+  assert.equal(e.sandbox.naukriObserver.isComplete(), false);
+});
+
 test("Naukri surfaces questionnaire controls the old exact-match filter would have dropped", () => {
   const e = createEnvironment({
-    scripts: manifestScripts("naukri"),
+    scripts: NAUKRI,
     url: "https://www.naukri.com/job-listings-x-1",
   });
   const panel = e.make("div", { class: "singleselect-radiobutton", rect: { x: 0, y: 0, width: 600, height: 400 } });

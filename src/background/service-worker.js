@@ -838,6 +838,51 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return sendResponse({ ok: true });
       }
 
+      // ---- Takeover: following a job into a new tab -----------------------
+      //
+      // A job on Naukri or LinkedIn often opens the company's own application
+      // in a NEW tab. A content script cannot see or drive another tab, so the
+      // takeover session asks the worker to run the application there and
+      // report back. The user watches it happen: the tab is focused, never
+      // hidden, and it is closed only if the worker opened it.
+
+      case "TAKEOVER_ADOPT_NEW_TAB": {
+        const sourceTabId = sender?.tab?.id;
+        if (!sourceTabId) return sendResponse({ ok: false, error: "no originating tab" });
+
+        // Find a tab opened from this one since the agent clicked.
+        const siblings = await chrome.tabs.query({ windowId: sender.tab.windowId });
+        const adopted = siblings.find((t) =>
+          t.id !== sourceTabId && t.openerTabId === sourceTabId);
+
+        if (!adopted) return sendResponse({ ok: true, adopted: false });
+
+        try {
+          await chrome.tabs.update(adopted.id, { active: true });
+          await waitForTab(adopted.id);
+
+          // The shared scripts are declared for https://*/* so they are
+          // already present; this only covers a tab that loaded too early.
+          await chrome.scripting.executeScript({
+            target: { tabId: adopted.id },
+            files: ["src/content/shared/takeover.js"],
+          }).catch(() => {});
+
+          const result = await chrome.tabs.sendMessage(adopted.id, {
+            type: "TAKEOVER_APPLY_HERE",
+          });
+
+          // Return to the results so the run can continue.
+          await chrome.tabs.remove(adopted.id).catch(() => {});
+          await chrome.tabs.update(sourceTabId, { active: true }).catch(() => {});
+
+          return sendResponse({ ok: true, adopted: true, result });
+        } catch (err) {
+          await chrome.tabs.update(sourceTabId, { active: true }).catch(() => {});
+          return sendResponse({ ok: false, adopted: true, error: String(err?.message || err) });
+        }
+      }
+
       // ---- Tab-level actions requested by the agent -----------------------
       //
       // The content script cannot open, switch or close tabs. It asks here,

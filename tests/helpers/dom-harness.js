@@ -64,11 +64,21 @@ class El {
 
   get children() { return this.childNodes.filter((n) => n.nodeType === 1); }
 
+  /** The parent, but only when it is an element (not the document). */
+  get parentElement() {
+    return this.parentNode?.nodeType === 1 ? this.parentNode : null;
+  }
+
   appendChild(child) {
     child.parentNode?.removeChild(child);
     child.parentNode = this;
     this.childNodes.push(child);
     return child;
+  }
+
+  /** Modern variadic append, used by overlay code. */
+  append(...nodes) {
+    for (const node of nodes) this.appendChild(node);
   }
 
   removeChild(child) {
@@ -140,6 +150,18 @@ class El {
     this.childNodes = [];
     this._text = String(v);
   }
+  /**
+   * Minimal innerHTML. Markup is stored verbatim rather than parsed: the
+   * modules under test use it only for inline decorative SVG, and nothing
+   * queries into that subtree.
+   */
+  get innerHTML() { return this._html ?? this.textContent; }
+  set innerHTML(v) {
+    this.childNodes = [];
+    this._html = String(v);
+    this._text = "";
+  }
+
   get innerText() {
     // Invisible subtrees contribute no text, as in a real browser.
     if (this.style.display === "none" || this.style.visibility === "hidden") return "";
@@ -296,15 +318,18 @@ export function createEnvironment(opts = {}) {
   };
 
   doc.documentElement = new El("html", doc);
+  doc.head = new El("head", doc);
   doc.body = new El("body", doc);
+  doc.documentElement.appendChild(doc.head);
   doc.body.setRect({ x: 0, y: 0, width: 1280, height: 4000 });
   doc.documentElement.appendChild(doc.body);
   doc.body.scrollHeight = 4000;
 
   doc.createElement = (tag) => new El(tag, doc);
-  doc.querySelectorAll = (sel) => doc.body.querySelectorAll(sel);
-  doc.querySelector = (sel) => doc.body.querySelector(sel);
-  doc.getElementById = (id) => doc.body.querySelector(`#${id}`);
+  // Search the whole document: styles live in <head>, content in <body>.
+  doc.querySelectorAll = (sel) => doc.documentElement.querySelectorAll(sel);
+  doc.querySelector = (sel) => doc.documentElement.querySelector(sel);
+  doc.getElementById = (id) => doc.documentElement.querySelector(`#${id}`);
   doc.contains = (el) => doc.body.contains(el) || el === doc.body;
   doc.elementFromPoint = (x, y) => {
     // Topmost element whose rect contains the point; later in document order
@@ -359,7 +384,12 @@ export function createEnvironment(opts = {}) {
     File: class { constructor(bits, name, o) { this.name = name; this.type = o?.type; } },
     atob: (s) => Buffer.from(s, "base64").toString("binary"),
     history: {
-      back: () => { sandbox.__historyDelta = -1; },
+      // A real browser restores the previous page on back(). Tests that care
+      // about navigation register a restore function; others just record it.
+      back: () => {
+        sandbox.__historyDelta = -1;
+        try { sandbox.__onHistoryBack?.(); } catch (_) { /* test-supplied */ }
+      },
       forward: () => { sandbox.__historyDelta = 1; },
     },
     // chrome.* is stubbed; content modules must tolerate its absence/failure.

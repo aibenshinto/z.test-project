@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AutoApply",
-  "version": "0.2.0",
-  "description": "Resume-driven job search and application assistant for Naukri and LinkedIn.",
+  "version": "0.3.0",
+  "description": "Watch an AI agent apply to jobs in your own browser tab, on Naukri, LinkedIn and company career sites.",
   "permissions": [
     "storage",
     "alarms",
@@ -11,14 +11,6 @@
     "sidePanel"
   ],
   "host_permissions": [
-    "https://*.naukri.com/*",
-    "https://*.linkedin.com/*",
-    "https://*.indeed.com/*",
-    "https://api.anthropic.com/*",
-    "https://api.openai.com/*",
-    "https://generativelanguage.googleapis.com/*"
-  ],
-  "optional_host_permissions": [
     "https://*/*"
   ],
   "background": {
@@ -34,16 +26,32 @@
   "content_scripts": [
     {
       "matches": [
-        "https://*.naukri.com/*"
+        "https://*/*"
       ],
       "js": [
         "src/content/shared/highlight.js",
+        "src/content/shared/cursor.js",
         "src/content/shared/interaction-core-bridge.js",
         "src/content/shared/observer-core.js",
         "src/content/shared/pointer-actions.js",
         "src/content/shared/diagnostics.js",
         "src/content/shared/executor-core.js",
         "src/content/shared/agent-loop-core.js",
+        "src/content/shared/results-walker.js",
+        "src/content/generic/observer.js",
+        "src/content/generic/executor.js",
+        "src/content/generic/agent-loop.js",
+        "src/content/generic/apply.js",
+        "src/content/shared/takeover.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://*.naukri.com/*"
+      ],
+      "js": [
         "src/content/naukri/selectors.js",
         "src/content/naukri/typing.js",
         "src/content/naukri/scrape.js",
@@ -60,13 +68,6 @@
         "https://*.linkedin.com/*"
       ],
       "js": [
-        "src/content/shared/highlight.js",
-        "src/content/shared/interaction-core-bridge.js",
-        "src/content/shared/observer-core.js",
-        "src/content/shared/pointer-actions.js",
-        "src/content/shared/diagnostics.js",
-        "src/content/shared/executor-core.js",
-        "src/content/shared/agent-loop-core.js",
         "src/content/linkedin/selectors.js",
         "src/content/linkedin/scrape.js",
         "src/content/linkedin/observer.js",

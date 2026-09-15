@@ -21,6 +21,28 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // The visible cursor overlay is purely cosmetic, so every call to it is
+  // wrapped: a missing overlay, or one that throws, must never stop an action.
+
+  async function cursorMove(x, y, note) {
+    try { await globalThis.__autoApplyCursor?.moveTo(x, y, { note }); }
+    catch (_) { /* cosmetic only */ }
+  }
+
+  function cursorFlash() {
+    try { globalThis.__autoApplyCursor?.flashClick(); }
+    catch (_) { /* cosmetic only */ }
+  }
+
+  /** Hit-test with the overlay hidden, falling back to a plain hit-test. */
+  function hitTest(x, y) {
+    try {
+      const cursor = globalThis.__autoApplyCursor;
+      if (cursor) return cursor.withHidden(() => document.elementFromPoint(x, y));
+    } catch (_) { /* fall through */ }
+    return document.elementFromPoint(x, y);
+  }
+
   // -------------------------------------------------------------------------
   // Scrolling
   // -------------------------------------------------------------------------
@@ -80,7 +102,7 @@
    * @param {Element} el
    * @returns {Promise<{executed: boolean, point: object|null, error?: string, hitTarget?: string}>}
    */
-  async function pointerClick(el) {
+  async function pointerClick(el, opts = {}) {
     if (!el || !el.isConnected) {
       return { executed: false, point: null, error: "element is not attached to the document" };
     }
@@ -102,12 +124,15 @@
       return { executed: false, point: null, error: "element has no usable on-screen position" };
     }
 
+    // Let the user see where the agent is about to click before it happens.
+    await cursorMove(point.x, point.y, opts.note);
+
     // Aim at whatever is actually on top at that point, as long as it belongs
     // to our element's subtree (or contains it). Otherwise the element is
     // covered by an unrelated overlay and clicking would hit the wrong thing.
     let target = el;
     let hitTarget = "self";
-    const top = document.elementFromPoint(point.x, point.y);
+    const top = hitTest(point.x, point.y);
     if (top && top !== el) {
       if (el.contains(top)) {
         target = top;
@@ -125,6 +150,7 @@
       firePointer(target, "pointerenter", x, y);
       fireMouse(target, "mouseover", x, y);
       fireMouse(target, "mousemove", x, y);
+      cursorFlash();
       firePointer(target, "pointerdown", x, y, { buttons: 1 });
       fireMouse(target, "mousedown", x, y, { buttons: 1 });
 
@@ -144,13 +170,26 @@
    * A plain DOM click — the cheap first attempt.
    * @param {Element} el
    */
-  async function domClick(el) {
+  async function domClick(el, opts = {}) {
     if (!el || !el.isConnected) {
       return { executed: false, error: "element is not attached to the document" };
     }
     await scrollIntoView(el);
+
+    // Show the cursor here too: the user should see the first attempt, not
+    // only the pointer-event retry that follows when a page ignores this.
+    const rect = el.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      await cursorMove(
+        Math.round(rect.x + rect.width / 2),
+        Math.round(rect.y + rect.height / 2),
+        opts.note,
+      );
+    }
+
     try {
       el.focus?.({ preventScroll: true });
+      cursorFlash();
       el.click();
       return { executed: true };
     } catch (err) {
@@ -159,11 +198,11 @@
   }
 
   /** Two pointer clicks in quick succession, plus the dblclick event. */
-  async function doubleClick(el) {
-    const first = await pointerClick(el);
+  async function doubleClick(el, opts = {}) {
+    const first = await pointerClick(el, opts);
     if (!first.executed) return first;
     await sleep(60);
-    const second = await pointerClick(el);
+    const second = await pointerClick(el, opts);
     if (second.executed && second.point) {
       fireMouse(el, "dblclick", second.point.x, second.point.y, { detail: 2 });
     }

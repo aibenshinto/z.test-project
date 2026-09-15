@@ -50,7 +50,11 @@
     try {
       if (naukriApplicationSubmitted()) return true;
     } catch (_) { /* selectors may not be loaded yet */ }
-    return Boolean(document.querySelector("[class*='already-applied'], [class*='appliedTag']"));
+    if (document.querySelector("[class*='already-applied'], [class*='appliedTag']")) return true;
+    // Naukri also renders a plain confirmation banner in some flows, which the
+    // marker selectors above miss. The shared evidence test is disqualified by
+    // sidebar rails and step counters, so this cannot fire on a results page.
+    return logic().hasSubmissionEvidence(core().visibleBodyText(3000));
   }
 
   // -------------------------------------------------------------------------
