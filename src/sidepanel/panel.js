@@ -583,8 +583,9 @@ function renderJobList(jobs, heading) {
 }
 
 for (const [id, type] of [["takeoverStop", "TAKEOVER_STOP"], ["takeoverPause", "TAKEOVER_PAUSE"], ["takeoverResume", "TAKEOVER_RESUME"]]) {
-  if (!$(id)) continue;
-  $(id).onclick = async () => {
+  const btn = $(id);
+  if (!btn) continue;
+  btn.onclick = async () => {
     const tab = await activeTab();
     if (!tab?.id) return;
     await chrome.tabs.sendMessage(tab.id, { type }).catch(() => {});

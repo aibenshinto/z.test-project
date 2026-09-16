@@ -122,14 +122,19 @@ function duplicateOf(queue, job) {
   );
 }
 
+let tickRunning = false;
+
 // One unit of work per tick: take the highest-ranked queued job and try it.
 async function tick() {
-  const session = await loadSession();
-  if (session.paused || session.state === STATES.STOPPED) return;
-  if (session.state === STATES.WAITING_FOR_USER || session.state === STATES.BLOCKED) {
-    await info("Holding for user", { state: session.state });
-    return;
-  }
+  if (tickRunning) return;
+  tickRunning = true;
+  try {
+    const session = await loadSession();
+    if (session.paused || session.state === STATES.STOPPED) return;
+    if (session.state === STATES.WAITING_FOR_USER || session.state === STATES.BLOCKED) {
+      await info("Holding for user", { state: session.state });
+      return;
+    }
 
   const gate = await canSubmit();
   if (!gate.ok) {
@@ -163,6 +168,11 @@ async function tick() {
     minRelevance: settings.governor.minRelevance,
     preferences: settings.preferences,
   });
+
+  // Check if the user paused or stopped the run while the model was evaluating.
+  const postEvalSession = await loadSession();
+  if (postEvalSession.paused || postEvalSession.state === STATES.STOPPED) return;
+
   next.evaluation = ev;
   next.relevance = ev.relevance;
   next.match_score = ev.match_score;
@@ -202,6 +212,9 @@ async function tick() {
     await saveSession(s);
 
     const result = await applyToJob(next, s);
+    console.log("[APPLY_TRACE] worker received:", JSON.stringify(result));
+    console.log("[APPLY_TRACE] submitted:", result?.submitted);
+    
     next.status = result.submitted ? "submitted"
       : result.waitingForUser ? "waiting_for_user"
       : result.blocked ? "blocked"
@@ -209,7 +222,11 @@ async function tick() {
       : "needs_review";
     next.result = result;
 
-    if (result.submitted) await recordSubmit({ site: next.site, jobId: next.id });
+    if (result.submitted) {
+      console.log("[APPLY_TRACE] recordSubmit called:", JSON.stringify({ site: next.site, jobId: next.id }));
+      await recordSubmit({ site: next.site, jobId: next.id });
+      console.log("[APPLY_TRACE] stats after submit:", JSON.stringify(await stats()));
+    }
     if (!result.submitted) {
       await warn("Application requires attention", {
         jobId: next.id,
@@ -275,6 +292,9 @@ async function tick() {
   await chrome.alarms.create(TICK, {
     when: Date.now() + randomDelay(settings.governor),
   });
+  } finally {
+    tickRunning = false;
+  }
 }
 
 async function applyToJob(job, session) {
@@ -715,6 +735,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "PAUSE":  await pauseRun();            return sendResponse({ ok: true });
       case "RESUME": await resumeRun();           return sendResponse({ ok: true });
       case "STATS":  return sendResponse(await stats());
+      case "RECORD_SUBMIT":
+        console.log("[APPLY_TRACE] recordSubmit called:", JSON.stringify(msg.payload));
+        await recordSubmit(msg.payload);
+        console.log("[APPLY_TRACE] stats after submit:", JSON.stringify(await stats()));
+        return sendResponse({ ok: true });
       case "GET_SESSION":
         return sendResponse({
           ok: true,

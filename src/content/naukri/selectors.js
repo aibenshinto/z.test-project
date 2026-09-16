@@ -153,10 +153,13 @@ globalThis.naukriVisible = visible;
 // ---------------------------------------------------------------------------
 
 function applicationSubmitted() {
+  if (document.querySelector("[class*='already-applied'], [class*='appliedTag']")) return true;
+  if (/\/myapply\/saveApply/i.test(location.pathname) && /applied\s+to/i.test(document.body?.innerText || "")) return true;
+  
   const btn = globalThis.naukriVisible("#apply-button, .apply-button");
-  if (!btn) return false;
-  if (/^applied/i.test(btn.innerText.trim())) return true;
-  return Boolean(document.querySelector("[class*='already-applied'], [class*='appliedTag']"));
+  if (btn && /^applied/i.test(btn.innerText.trim())) return true;
+  
+  return false;
 }
 
 function profileIncompleteBlock() {
