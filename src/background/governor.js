@@ -53,9 +53,16 @@ export function randomDelay({ minDelayMs, maxDelayMs }) {
   return minDelayMs + Math.random() * (maxDelayMs - minDelayMs);
 }
 
-export async function recordSubmit({ site, jobId }) {
+export async function recordSubmit(jobData) {
   const log = await recent();
-  log.push({ at: Date.now(), site, jobId });
+  log.push({
+    at: Date.now(),
+    site: jobData.site,
+    jobId: jobData.jobId || jobData.id,
+    title: jobData.title,
+    company: jobData.company,
+    url: jobData.url
+  });
   await set(LOG_KEY, log);
 }
 

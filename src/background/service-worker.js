@@ -224,7 +224,7 @@ async function tick() {
 
     if (result.submitted) {
       console.log("[APPLY_TRACE] recordSubmit called:", JSON.stringify({ site: next.site, jobId: next.id }));
-      await recordSubmit({ site: next.site, jobId: next.id });
+      await recordSubmit(next);
       console.log("[APPLY_TRACE] stats after submit:", JSON.stringify(await stats()));
     }
     if (!result.submitted) {
@@ -478,7 +478,7 @@ async function userAnswerAndContinue(answer) {
   }
   if (result && result.submitted) {
     job.status = "submitted";
-    await recordSubmit({ site: job.site, jobId: job.id });
+    await recordSubmit(job);
     await chrome.tabs.remove(tabId).catch(() => {});
     await set("queue", queue);
     await saveSession({ ...emptySession(), state: STATES.COMPLETED, updatedAt: Date.now() });
@@ -706,7 +706,7 @@ async function enableExternalSiteAndContinue() {
     : result?.waitingForUser ? "waiting_for_user"
     : result?.blocked ? "blocked"
     : "needs_review";
-  if (result?.submitted) await recordSubmit({ site: "generic", jobId: job.id });
+  if (result?.submitted) await recordSubmit({ ...job, site: "generic" });
   await set("queue", queue);
   return { ok: true, result };
 }

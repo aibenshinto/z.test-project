@@ -350,7 +350,7 @@
     if (outcome.submitted) {
       applied.push(entry);
       report({ phase: "applied", job: entry.title, note: `Applied to "${String(entry.title).slice(0, 40)}"` });
-      chrome.runtime.sendMessage({ type: "RECORD_SUBMIT", payload: { site: window.location.hostname, jobId: entry.id } }).catch(() => {});
+      chrome.runtime.sendMessage({ type: "RECORD_SUBMIT", payload: { ...entry, site: window.location.hostname } }).catch(() => {});
     } else {
       skipped.push(entry);
       report({ phase: "skip", job: entry.title, note: entry.reason || "not submitted" });
