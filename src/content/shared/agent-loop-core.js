@@ -159,12 +159,13 @@
    * `needVisual` asks the worker to attach a screenshot. Requested only when
    * the DOM alone was not enough (Part 23) — a normal turn stays text-only.
    */
-  async function decide(snapshot, { needVisual = false, lastFailure = null } = {}) {
+  async function decide(snapshot, { needVisual = false, lastFailure = null, job = null } = {}) {
     const res = await chrome.runtime.sendMessage({
       type: "AI_DECIDE_ACTION",
       snapshot,
       needVisual,
       lastFailure,
+      job,
     });
     if (!res?.ok) {
       throw new Error("AI_DECIDE_ACTION failed: " + (res?.error || "no response"));
@@ -182,6 +183,7 @@
    * @param {PlatformAdapter} adapter
    * @param {object} [opts]
    * @param {number} [opts.maxTurns=30]
+   * @param {object} [opts.job]  { title, company } of the job being applied for
    * @returns {Promise<object>} { submitted, applicationStatus, answered, turns, ... }
    */
   async function run(adapter, opts = {}) {
@@ -278,7 +280,7 @@
       // 4. Decide
       let action;
       try {
-        action = await decide(snapshot, { needVisual, lastFailure });
+        action = await decide(snapshot, { needVisual, lastFailure, job: jobContext(opts.job) });
         needVisual = false;
         lastFailure = null;
       } catch (err) {
@@ -306,6 +308,33 @@
           error: String(err?.message || err),
         };
         log(`[EXECUTOR] ${action.action} threw: ${result.error}`);
+      }
+
+      // The click opened a new tab. From an apply control, the application
+      // has moved there, so hand it to the caller to follow. Anything else —
+      // a company profile, a reviews site — is a detour: close it and carry on
+      // here, instead of leaving this page stalled in the background until the
+      // user closes the tab by hand.
+      if (result.openedTab) {
+        const meta = obs().getMeta(action.target);
+        if (meta && core().rankApplyIntent(meta) > 0) {
+          return {
+            submitted: false,
+            applicationStatus: core().APPLICATION_STATUS.UNKNOWN,
+            answered, turns,
+            external: true,
+            newTab: result.openedTab,
+            reason: "The application continued in a new tab.",
+          };
+        }
+        await closeOpenedTab(result.openedTab.id);
+        result = {
+          ...result,
+          success: false,
+          verified: false,
+          result: core().ACTION_RESULT.NO_EFFECT,
+          error: `this opened an unrelated page (${result.openedTab.url || "unknown"}) in a new tab, which was closed`,
+        };
       }
 
       answered.push({
@@ -407,6 +436,18 @@
     };
   }
 
+  /** Only what the model needs to know which job this is. */
+  function jobContext(job) {
+    return job?.title ? { title: job.title, company: job.company || null } : null;
+  }
+
+  /** Ask the worker to close a tab this page opened, and refocus this page. */
+  async function closeOpenedTab(tabId) {
+    try {
+      await chrome.runtime.sendMessage({ type: "CLOSE_OPENED_TAB", tabId });
+    } catch (_) { /* non-fatal: the tab may already be gone */ }
+  }
+
   async function fetchResume() {
     try {
       const ctx = await chrome.runtime.sendMessage({ type: "GET_APPLY_CONTEXT" });
@@ -463,10 +504,24 @@
         log(`[AGENT] Apply budget exhausted after ${tried} candidate(s)`);
         break;
       }
+
+      // A disabled control starts nothing — for example a bulk "Apply" that
+      // waits for jobs to be ticked — and clicking it can only fail.
+      if (obs().getMeta(cand.id)?.disabled) {
+        log(`[AGENT] Skipping disabled apply control ${cand.id} ("${cand.name}")`);
+        continue;
+      }
       tried++;
 
       log(`[AGENT] Trying apply control ${cand.id} ("${cand.name}") from ${cand.source}`);
       const result = await exec().click(cand.id, { settleMax });
+
+      // The apply control opened the application in a new tab (typically the
+      // company's own site). The caller follows it there.
+      if (result.openedTab) {
+        log(`[AGENT] ${cand.id} opened the application in a new tab`);
+        return { opened: true, via: cand, clickResult: result, newTab: result.openedTab };
+      }
 
       // The click may be CONFIRMED (page changed) while the change was not the
       // dialog we wanted — so the authoritative test is `opened()`.

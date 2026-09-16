@@ -164,6 +164,18 @@ test("decideAction returns stop when askJSON is null", async () => {
   assert.equal(result.action, "stop");
 });
 
+test("decideAction tells the model which job it is applying for", async () => {
+  // A company careers page can list many openings with an Apply each.
+  let prompt = "";
+  const mockAskJSON = async ({ user }) => { prompt = user; return { action: "stop", reason: "test" }; };
+  const snapshot = { page: { applicationState: "ready" }, controls: [], questions: [], loading: false };
+
+  await decideAction(snapshot, {}, mockAskJSON, { job: { title: "Python Developer", company: "Acme" } });
+
+  assert.match(prompt, /ApplyingFor:[\s\S]*"title":"Python Developer"/);
+  assert.match(prompt, /not this one, stop/);
+});
+
 test("decideAction passes validated action from LLM through", async () => {
   const snapshot = {
     page: { applicationState: "questionnaire" },

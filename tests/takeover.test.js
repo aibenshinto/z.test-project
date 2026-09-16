@@ -174,6 +174,44 @@ test("a job card that does not respond is reported, not silently counted", async
   assert.match(result.reason, /did not appear/i);
 });
 
+test("a job that opens in a new tab is clicked once, not clicked again as unresponsive", async () => {
+  const { e, jobs } = resultsPage("www.naukri.com", 1);
+
+  let clicks = 0;
+  jobs[0].link.addEventListener("click", () => {
+    clicks++;
+    e.document.visibilityState = "hidden"; // the new tab takes focus
+  });
+  e.sandbox.chrome.runtime.sendMessage = async (msg) =>
+    msg.type === "TAB_OPENED_SINCE" && clicks
+      ? { ok: true, opened: true, tab: { id: 42, url: "https://www.naukri.com/job-listings-x" } }
+      : { ok: true };
+
+  const walker = e.sandbox.__autoApplyResultsWalker;
+  const result = await walker.openJob(walker.findJobs()[0], () => false, { settleMax: 200, openWaitMs: 400 });
+
+  assert.equal(clicks, 1, "a retry would open the job a second time");
+  assert.equal(result.opened, true);
+  assert.equal(result.newTab.id, 42);
+});
+
+test("the Naukri and LinkedIn bridges leave takeover messages to the takeover listener", () => {
+  // Every listener in a tab sees every message and the first reply wins, so
+  // an "unknown message" reply here pre-empted the real TAKEOVER_* replies.
+  for (const file of ["src/content/naukri/main.js", "src/content/linkedin/main.js"]) {
+    let listener = null;
+    const chrome = { runtime: { onMessage: { addListener: (fn) => { listener = fn; } } } };
+    new Function("chrome", readFileSync(fileURLToPath(new URL(`../${file}`, import.meta.url)), "utf8"))(chrome);
+
+    for (const type of ["TAKEOVER_START", "TAKEOVER_APPLY_HERE", "TAKEOVER_PROBE"]) {
+      let replied = false;
+      const keepsChannel = listener({ type }, {}, () => { replied = true; });
+      assert.equal(keepsChannel, false, `${file} must not claim ${type}`);
+      assert.equal(replied, false, `${file} must not answer ${type}`);
+    }
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Pagination
 // ---------------------------------------------------------------------------
@@ -300,7 +338,7 @@ test("the agent works down the whole list the user searched for", async () => {
   wireJobFlow(e, jobs);
 
   e.sandbox.chrome.runtime.sendMessage = async (msg) =>
-    msg.type === "AI_DECIDE_ACTION" ? { ok: true, action: { action: "finish" } } : { ok: true, adopted: false };
+    msg.type === "AI_DECIDE_ACTION" ? { ok: true, action: { action: "finish" } } : { ok: true, adopted: false, decision: "APPLY" };
 
   const result = await e.sandbox.__autoApplyTakeover.run({ maxJobs: 3, maxPages: 1 });
 
@@ -319,7 +357,7 @@ test("the run reports progress the side panel can show while it works", async ()
   e.sandbox.chrome.runtime.sendMessage = async (msg) => {
     if (msg.type === "TAKEOVER_PROGRESS") phases.push(msg.phase);
     if (msg.type === "AI_DECIDE_ACTION") return { ok: true, action: { action: "finish" } };
-    return { ok: true, adopted: false };
+    return { ok: true, adopted: false, decision: "APPLY" };
   };
 
   await e.sandbox.__autoApplyTakeover.run({ maxJobs: 2, maxPages: 1 });
@@ -334,7 +372,7 @@ test("a job whose apply button does nothing is skipped, not counted as applied",
   wireJobFlow(e, jobs, { applyOpensForm: false });
 
   e.sandbox.chrome.runtime.sendMessage = async (msg) =>
-    msg.type === "AI_DECIDE_ACTION" ? { ok: true, action: { action: "stop", reason: "no form" } } : { ok: true, adopted: false };
+    msg.type === "AI_DECIDE_ACTION" ? { ok: true, action: { action: "stop", reason: "no form" } } : { ok: true, adopted: false, decision: "APPLY" };
 
   const result = await e.sandbox.__autoApplyTakeover.run({ maxJobs: 2, maxPages: 1 });
 
@@ -347,7 +385,7 @@ test("maxJobs bounds the run", async () => {
   wireJobFlow(e, jobs);
 
   e.sandbox.chrome.runtime.sendMessage = async (msg) =>
-    msg.type === "AI_DECIDE_ACTION" ? { ok: true, action: { action: "finish" } } : { ok: true, adopted: false };
+    msg.type === "AI_DECIDE_ACTION" ? { ok: true, action: { action: "finish" } } : { ok: true, adopted: false, decision: "APPLY" };
 
   const result = await e.sandbox.__autoApplyTakeover.run({ maxJobs: 2, maxPages: 1 });
   assert.equal(result.appliedCount + result.skippedCount, 2);
@@ -371,7 +409,7 @@ test("a CAPTCHA mid-run stops everything and leaves the page for the user", asyn
   }
 
   e.sandbox.chrome.runtime.sendMessage = async (msg) =>
-    msg.type === "AI_DECIDE_ACTION" ? { ok: true, action: { action: "finish" } } : { ok: true, adopted: false };
+    msg.type === "AI_DECIDE_ACTION" ? { ok: true, action: { action: "finish" } } : { ok: true, adopted: false, decision: "APPLY" };
 
   const result = await e.sandbox.__autoApplyTakeover.run({ maxJobs: 3, maxPages: 1 });
 
@@ -396,10 +434,190 @@ test("a stop request ends the run rather than finishing the list", async () => {
   e.sandbox.chrome.runtime.sendMessage = async (msg) =>
     msg.type === "AI_DECIDE_ACTION"
       ? { ok: true, action: { action: "stop", reason: "test" } }
-      : { ok: true, adopted: false };
+      : { ok: true, adopted: false, decision: "APPLY" };
 
   const result = await t.run({ maxJobs: 3, maxPages: 1 });
 
   assert.equal(result.ok, true);
   assert.ok(result.appliedCount + result.skippedCount < 3, "the run must not process every job after Stop");
+});
+
+// ---------------------------------------------------------------------------
+// Jobs that open in a new tab
+// ---------------------------------------------------------------------------
+
+/**
+ * Wire a results page where every job opens in a new tab, as Naukri's do.
+ * The worker follows each tab and reports `adoptResult` for it.
+ */
+function wireNewTabJobs(e, jobs, adoptResult) {
+  e.sandbox.__autoApplyTakeover.configure({
+    settleMax: 200, afterOpen: 50, betweenJobs: 20, afterPage: 50,
+    backAttempts: 1, backWait: 50, openWaitMs: 400, applyBudgetMs: 1500,
+  });
+
+  let nextTabId = 100;
+  let opened = null;
+  for (const { link } of jobs) {
+    link.addEventListener("click", () => {
+      e.document.visibilityState = "hidden";
+      opened = { id: nextTabId++, url: link.getAttribute("href") };
+    });
+  }
+
+  const followed = [];
+  e.sandbox.chrome.runtime.sendMessage = async (msg) => {
+    switch (msg.type) {
+      case "TAB_OPENED_SINCE":
+        return opened ? { ok: true, opened: true, tab: opened } : { ok: true, opened: false };
+      case "TAKEOVER_ADOPT_NEW_TAB":
+        if (msg.tabId == null) return { ok: true, adopted: false, decision: "APPLY" };
+        followed.push(msg.tabId);
+        opened = null;
+        e.document.visibilityState = "visible"; // the worker refocuses the results
+        return { ok: true, adopted: true, result: adoptResult };
+      case "TAKEOVER_EVALUATE_JOB":
+        return { ok: true, decision: "APPLY" };
+      default:
+        return { ok: true };
+    }
+  };
+  return followed;
+}
+
+test("the run follows each job into the tab it opens, without the user taking over again", async () => {
+  const { e, jobs } = resultsPage("www.naukri.com", 2);
+  const followed = wireNewTabJobs(e, jobs, {
+    submitted: true, applicationStatus: "APPLICATION_SUBMITTED",
+  });
+
+  const result = await e.sandbox.__autoApplyTakeover.run({ maxJobs: 2, maxPages: 1 });
+
+  assert.deepEqual(followed, [100, 101], "each job's new tab must be followed, once");
+  assert.equal(result.appliedCount, 2);
+});
+
+test("a question in a followed tab ends the run, leaving that tab to the user", async () => {
+  const { e, jobs } = resultsPage("www.naukri.com", 2);
+  const followed = wireNewTabJobs(e, jobs, {
+    submitted: false, waitingForUser: true, question: "What is your notice period?",
+  });
+
+  const result = await e.sandbox.__autoApplyTakeover.run({ maxJobs: 2, maxPages: 1 });
+
+  assert.deepEqual(followed, [100], "the run must not move on to the next job");
+  assert.equal(result.waitingForUser, true);
+  assert.equal(result.question, "What is your notice period?");
+});
+
+// ---------------------------------------------------------------------------
+// Only jobs that fit the profile
+// ---------------------------------------------------------------------------
+
+test("a job that does not fit the profile is skipped without being opened", async () => {
+  const { e, jobs } = resultsPage("www.naukri.com", 2);
+  const followed = wireNewTabJobs(e, jobs, { submitted: true, applicationStatus: "APPLICATION_SUBMITTED" });
+
+  const evaluated = [];
+  const worker = e.sandbox.chrome.runtime.sendMessage;
+  e.sandbox.chrome.runtime.sendMessage = async (msg) => {
+    if (msg.type !== "TAKEOVER_EVALUATE_JOB") return worker(msg);
+    evaluated.push(msg.job);
+    return msg.job.title === "Python Developer 1"
+      ? { ok: true, decision: "SKIP", reason: "Does not match your profile (20% match)" }
+      : { ok: true, decision: "APPLY", reason: "Matches your profile (80% match)" };
+  };
+
+  const result = await e.sandbox.__autoApplyTakeover.run({ maxJobs: 2, maxPages: 1 });
+
+  assert.match(evaluated[0].text, /Acme Corp/, "the card's text must reach the evaluator");
+  assert.equal(followed.length, 1, "only the matching job may be opened");
+  assert.deepEqual(result.applied.map((j) => j.title), ["Python Developer 2"]);
+  assert.match(result.skipped[0].reason, /does not match your profile/i);
+});
+
+test("without a valid profile the run stops before opening any job", async () => {
+  const { e, jobs } = resultsPage("www.naukri.com", 2);
+  const followed = wireNewTabJobs(e, jobs, { submitted: true });
+  const worker = e.sandbox.chrome.runtime.sendMessage;
+  e.sandbox.chrome.runtime.sendMessage = async (msg) =>
+    msg.type === "TAKEOVER_EVALUATE_JOB"
+      ? { ok: false, error: "Complete and save a valid candidate profile first" }
+      : worker(msg);
+
+  const result = await e.sandbox.__autoApplyTakeover.run({ maxJobs: 2, maxPages: 1 });
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /profile/);
+  assert.deepEqual(followed, []);
+});
+
+// ---------------------------------------------------------------------------
+// Opening jobs without tripping the pop-up blocker
+// ---------------------------------------------------------------------------
+
+test("a job link that opens in a new tab is opened by the worker, not by a scripted click", async () => {
+  const { e, jobs } = resultsPage("www.naukri.com", 1);
+  jobs[0].link.setAttribute("target", "_blank");
+  let clicks = 0;
+  jobs[0].link.addEventListener("click", () => clicks++);
+
+  const requests = [];
+  e.sandbox.chrome.runtime.sendMessage = async (msg) => {
+    if (msg.type !== "OPEN_TAB_FROM_PAGE") return { ok: true };
+    requests.push(msg.url);
+    return { ok: true, tab: { id: 9, url: msg.url } };
+  };
+
+  const walker = e.sandbox.__autoApplyResultsWalker;
+  const result = await walker.openJob(walker.findJobs()[0], () => false, { settleMax: 200, openWaitMs: 400 });
+
+  assert.equal(clicks, 0, "Chrome blocks a scripted target=_blank click as a pop-up");
+  assert.deepEqual(requests, ["https://www.naukri.com/job-listings-python-developer-acme-100000"]);
+  assert.equal(result.newTab.id, 9);
+});
+
+// ---------------------------------------------------------------------------
+// Company careers pages that list many jobs
+// ---------------------------------------------------------------------------
+
+/** A careers page table: one row per opening, each with its own Apply link. */
+function careersPage(titles) {
+  const e = createEnvironment({
+    scripts: scriptsFor("knowledgesprint.test"),
+    url: "https://knowledgesprint.test/careers",
+    title: "Careers",
+  });
+  e.sandbox.__autoApplyTakeover.configure({ settleMax: 200, openWaitMs: 300, applyBudgetMs: 1500 });
+  const clicked = [];
+  titles.forEach((title, i) => {
+    const row = e.make("tr", { rect: { x: 0, y: 100 + i * 80, width: 1000, height: 70 } });
+    e.make("td", { text: title, rect: { x: 0, y: 100 + i * 80, width: 300, height: 70 } }, row);
+    const apply = e.make("a", { href: `https://knowledgesprint.test/apply/${i}`, text: "Apply", rect: { x: 900, y: 120 + i * 80, width: 60, height: 20 } }, row);
+    apply.addEventListener("click", () => clicked.push(title));
+  });
+  return { e, clicked };
+}
+
+test("on a careers page listing many jobs, the agent clicks this job's own Apply", async () => {
+  const { e, clicked } = careersPage(["Intern - HR Executive", "Intern - Linux System Engineer", "Python Developer - AI Assisted Development"]);
+  e.sandbox.chrome.runtime.sendMessage = async () => ({ ok: true });
+
+  await e.sandbox.__autoApplyTakeover.applyToOpenJob({ title: "Python Developer - AI Assisted Development", company: "Knowledgesprint" });
+
+  // The test page does not react, so the click is retried; every retry must
+  // still land on this job's row, never a neighbour's.
+  assert.ok(clicked.length >= 1);
+  assert.deepEqual([...new Set(clicked)], ["Python Developer - AI Assisted Development"]);
+});
+
+test("a careers page that does not list this job is skipped without clicking any Apply", async () => {
+  const { e, clicked } = careersPage(["Intern - HR Executive", "Intern - AWS Cloud Engineer"]);
+  e.sandbox.chrome.runtime.sendMessage = async () => ({ ok: true });
+
+  const result = await e.sandbox.__autoApplyTakeover.applyToOpenJob({ title: "Python Developer", company: "Knowledgesprint" });
+
+  assert.deepEqual(clicked, [], "applying for a different job is worse than not applying");
+  assert.equal(result.submitted, false);
+  assert.match(result.reason, /lists several jobs, but not "Python Developer"/);
 });

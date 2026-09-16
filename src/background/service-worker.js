@@ -48,6 +48,114 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === TICK) await tick();
 });
 
+// ---- Tabs opened by pages ---------------------------------------------------
+//
+// A click on a target=_blank link changes nothing on the page that was
+// clicked, so a content script cannot tell it worked. This records which tab
+// opened which, and when, so the page can ask. Kept in memory only: a takeover
+// run messages the worker constantly, so it is not evicted mid-run.
+
+/** tabId → { id, openerTabId, createdAt } */
+const openedTabs = new Map();
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (tab.openerTabId == null) return;
+  openedTabs.set(tab.id, { id: tab.id, openerTabId: tab.openerTabId, createdAt: Date.now() });
+});
+chrome.tabs.onRemoved.addListener((tabId) => openedTabs.delete(tabId));
+
+/**
+ * The most recent still-open tab that `openerTabId` opened at or after
+ * `since`, waiting up to `waitMs` for its creation event to arrive.
+ */
+async function tabOpenedBy(openerTabId, since, waitMs = 0) {
+  const deadline = Date.now() + Math.min(Number(waitMs) || 0, 5000);
+  for (;;) {
+    const candidates = [...openedTabs.values()]
+      .filter((t) => t.openerTabId === openerTabId && t.createdAt >= since)
+      .sort((a, b) => b.createdAt - a.createdAt);
+    for (const { id } of candidates) {
+      const tab = await chrome.tabs.get(id).catch(() => null);
+      if (tab) return tab;
+      openedTabs.delete(id);
+    }
+    if (Date.now() >= deadline) return null;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+/**
+ * Run the takeover application in `tabId` and return its outcome, following
+ * the application across page loads.
+ *
+ * Apply on a job board often sends the same tab on to the company's own site.
+ * That unloads the page mid-application and closes the message channel; the
+ * new page has its own content scripts, so pick up again there.
+ */
+async function applyInTab(tabId, job) {
+  // Multi-page ATS flows (Workday, Taleo) load a new page per step.
+  const MAX_PAGES = 10;
+  let lastError = null;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    await waitForTab(tabId);
+
+    // The shared scripts are declared for https://*/* so they are already
+    // present; this only covers a tab that loaded too early.
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["src/content/shared/takeover.js"],
+    }).catch(() => {});
+
+    try {
+      return await chrome.tabs.sendMessage(tabId, { type: "TAKEOVER_APPLY_HERE", job });
+    } catch (err) {
+      lastError = String(err?.message || err);
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tab) throw new Error("the application tab was closed");
+      await info("Application moved to another page; following it", { url: tab.pendingUrl || tab.url });
+      // Let the next page start loading before waiting for it to finish.
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+  return { submitted: false, reason: `the application kept moving between pages (${lastError})` };
+}
+
+/** Shape a results card, read as plain text, for the evaluator. */
+function jobFromCard({ title = "", company = "", url = "", text = "" }) {
+  const body = String(text).slice(0, 2000);
+  return {
+    id: url, url, title, company,
+    summary: body,
+    experience: (body.match(/\d+\s*-\s*\d+\s*yrs?/i) || [""])[0],
+    // The card does not mark which part is the location; the scorer only
+    // looks for preferred cities (or "remote") in it, so the whole card works.
+    location: body,
+    postedOn: (body.match(/\b(?:just now|today|few hours ago|\d+\+?\s*(?:day|week|month)s?\s+ago)\b/i) || [""])[0],
+    tags: [],
+  };
+}
+
+function fitReason(ev) {
+  const verdict = ev.decision === "APPLY" ? "Matches your profile"
+    : ev.decision === "REVIEW" ? "Unclear match with your profile, left for you to review"
+    : "Does not match your profile";
+  const why = [...(ev.missing_requirements || []), ...(ev.risk_flags || []), ...(ev.reasons || [])]
+    .slice(0, 3).join("; ");
+  return `${verdict} (${ev.match_score}% match)${why ? `: ${why}` : ""}`;
+}
+
+/**
+ * Only a tab that the asking page itself opened may be adopted or closed.
+ * The record taken at creation counts too: Chrome can clear a tab's live
+ * `openerTabId` once the user switches tabs.
+ */
+async function childTab(openerTabId, tabId) {
+  const tab = await chrome.tabs.get(Number(tabId)).catch(() => null);
+  if (!tab) return null;
+  const opener = openedTabs.get(tab.id)?.openerTabId ?? tab.openerTabId;
+  return opener === openerTabId ? tab : null;
+}
+
 async function loadSession() {
   return (await get(SESSION, null)) || emptySession();
 }
@@ -765,6 +873,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const action = await decideAction(msg.snapshot, profile, askJSON, {
             screenshot,
             lastFailure: msg.lastFailure || null,
+            job: msg.job || null,
           });
           return sendResponse({ ok: true, action, visual: Boolean(screenshot) });
         } catch (err) {
@@ -846,31 +955,85 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // report back. The user watches it happen: the tab is focused, never
       // hidden, and it is closed only if the worker opened it.
 
+      case "TAB_OPENED_SINCE": {
+        // Asked by the executor after a click: did that click open a tab?
+        const sourceTabId = sender?.tab?.id;
+        if (!sourceTabId) return sendResponse({ ok: true, opened: false });
+        const tab = await tabOpenedBy(sourceTabId, Number(msg.since) || 0, msg.waitMs);
+        return sendResponse(tab
+          ? { ok: true, opened: true, tab: { id: tab.id, url: tab.pendingUrl || tab.url || "" } }
+          : { ok: true, opened: false });
+      }
+
+      case "OPEN_TAB_FROM_PAGE": {
+        // A results page opening a job in a new tab. The worker does it,
+        // because Chrome blocks a page's scripted new-tab clicks as pop-ups.
+        const url = safeHttpUrl(msg.url);
+        const source = sender?.tab;
+        if (!url) return sendResponse({ ok: false, error: "refused: only http(s) URLs may be opened" });
+        if (!source?.id) return sendResponse({ ok: false, error: "no originating tab" });
+        const tab = await chrome.tabs.create({
+          url, active: true, openerTabId: source.id, index: source.index + 1,
+        });
+        openedTabs.set(tab.id, { id: tab.id, openerTabId: source.id, createdAt: Date.now() });
+        return sendResponse({ ok: true, tab: { id: tab.id, url } });
+      }
+
+      case "TAKEOVER_EVALUATE_JOB": {
+        // Before the agent opens a job: does it fit the candidate at all?
+        const profile = await getProfile();
+        if (!profile?._validation?.ok) {
+          return sendResponse({
+            ok: false,
+            error: "Complete and save a valid candidate profile first: the agent only applies to jobs that match it.",
+          });
+        }
+        const settings = await getSettings();
+        const job = jobFromCard(msg.job || {});
+        // The model is consulted only for jobs the heuristic finds uncertain.
+        const ev = await evaluateJobWithModel(job, profile, askJSON, {
+          minRelevance: settings.governor.minRelevance,
+          preferences: settings.preferences,
+        });
+        await info("Takeover job evaluated", { title: job.title, decision: ev.decision, match_score: ev.match_score });
+        return sendResponse({ ok: true, decision: ev.decision, match_score: ev.match_score, reason: fitReason(ev) });
+      }
+
+      case "CLOSE_OPENED_TAB": {
+        // The agent opened a page it did not want (a company profile, a
+        // reviews site). Close it and bring back the page it was working on.
+        const sourceTabId = sender?.tab?.id;
+        const tab = sourceTabId && await childTab(sourceTabId, msg.tabId);
+        if (!tab) return sendResponse({ ok: false, error: "refused: this page did not open that tab" });
+        await chrome.tabs.remove(tab.id).catch(() => {});
+        await chrome.tabs.update(sourceTabId, { active: true }).catch(() => {});
+        return sendResponse({ ok: true });
+      }
+
       case "TAKEOVER_ADOPT_NEW_TAB": {
         const sourceTabId = sender?.tab?.id;
         if (!sourceTabId) return sendResponse({ ok: false, error: "no originating tab" });
 
-        // Find a tab opened from this one since the agent clicked.
-        const siblings = await chrome.tabs.query({ windowId: sender.tab.windowId });
-        const adopted = siblings.find((t) =>
-          t.id !== sourceTabId && t.openerTabId === sourceTabId);
+        // The exact tab the click opened, or else one this page opened since
+        // the click. Never an older tab: the user may have opened jobs of
+        // their own from the same results page.
+        const adopted = msg.tabId != null
+          ? await childTab(sourceTabId, msg.tabId)
+          : msg.since != null
+            ? await tabOpenedBy(sourceTabId, Number(msg.since))
+            : null;
 
         if (!adopted) return sendResponse({ ok: true, adopted: false });
 
         try {
           await chrome.tabs.update(adopted.id, { active: true });
-          await waitForTab(adopted.id);
+          const result = await applyInTab(adopted.id, msg.job || null);
 
-          // The shared scripts are declared for https://*/* so they are
-          // already present; this only covers a tab that loaded too early.
-          await chrome.scripting.executeScript({
-            target: { tabId: adopted.id },
-            files: ["src/content/shared/takeover.js"],
-          }).catch(() => {});
-
-          const result = await chrome.tabs.sendMessage(adopted.id, {
-            type: "TAKEOVER_APPLY_HERE",
-          });
+          // A challenge or a question for the user ends the run: leave that
+          // tab open and in front, where they can act on it.
+          if (result?.blocked || result?.stopped || result?.waitingForUser) {
+            return sendResponse({ ok: true, adopted: true, result });
+          }
 
           // Return to the results so the run can continue.
           await chrome.tabs.remove(adopted.id).catch(() => {});

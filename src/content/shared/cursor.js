@@ -153,6 +153,10 @@
       // On the first move there is no meaningful origin, so just appear.
       if (!from.x && !from.y) { place(x, y); return; }
 
+      // Nobody can see a glide in a background tab, and there each step's
+      // timer is throttled to about a second, so one move would take ~16s.
+      if (document.visibilityState === "hidden") { place(x, y); return; }
+
       for (let i = 1; i <= steps; i++) {
         // Ease-out so the motion reads as deliberate rather than mechanical.
         const t = 1 - Math.pow(1 - i / steps, 3);

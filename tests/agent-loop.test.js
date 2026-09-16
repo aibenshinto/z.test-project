@@ -205,6 +205,70 @@ test("an external application is handed off rather than automated in place", asy
   assert.equal(result.submitted, false);
 });
 
+/**
+ * An environment whose worker reports a new tab after `link` is clicked, and
+ * records the tabs the loop asks it to close.
+ */
+function envWithNewTab(actions, linkProps) {
+  const e = createEnvironment({ scripts: SHARED });
+  const queue = [...actions];
+  const closed = [];
+  let opened = null;
+
+  const link = e.make("a", { rect: { x: 0, y: 0, width: 200, height: 24 }, ...linkProps });
+  link.addEventListener("click", () => {
+    e.document.visibilityState = "hidden"; // the new tab takes focus
+    opened = { id: 7, url: linkProps.href };
+  });
+
+  e.sandbox.chrome.runtime.sendMessage = async (msg) => {
+    switch (msg.type) {
+      case "AI_DECIDE_ACTION":
+        return { ok: true, action: queue.shift() || { action: "stop", reason: "script exhausted" } };
+      case "TAB_OPENED_SINCE":
+        return opened ? { ok: true, opened: true, tab: opened } : { ok: true, opened: false };
+      case "CLOSE_OPENED_TAB":
+        closed.push(msg.tabId);
+        opened = null;
+        e.document.visibilityState = "visible";
+        return { ok: true };
+      default:
+        return { ok: true };
+    }
+  };
+  return { e, closed };
+}
+
+test("a click that opens an unrelated page in a new tab closes it and carries on", async () => {
+  // e.g. the company name linking to a reviews site: the agent must not sit
+  // stalled in a background tab until the user closes that page by hand.
+  const { e, closed } = envWithNewTab(
+    [{ action: "click", target: "element_1" }, { action: "stop", reason: "test" }],
+    { href: "https://reviews.example/acme", text: "Acme Corp reviews" },
+  );
+
+  const result = await e.sandbox.__autoApplyAgentLoopCore.run(adapterFor(e), { maxTurns: 3 });
+
+  assert.deepEqual(closed, [7], "the stray tab must be closed");
+  assert.equal(result.newTab, undefined);
+  assert.equal(result.answered[0].result.verdict, "ACTION_NO_EFFECT");
+  assert.match(result.answered[0].result.error, /unrelated page/);
+});
+
+test("an apply control that opens a new tab hands the application over to it", async () => {
+  const { e, closed } = envWithNewTab(
+    [{ action: "click", target: "element_1" }],
+    { href: "https://careers.acme.test/apply/1", text: "Apply on company site" },
+  );
+
+  const result = await e.sandbox.__autoApplyAgentLoopCore.run(adapterFor(e), { maxTurns: 3 });
+
+  assert.deepEqual(closed, [], "the application tab must not be closed");
+  assert.equal(result.newTab.id, 7);
+  assert.equal(result.external, true);
+  assert.equal(result.submitted, false);
+});
+
 test("reaching maxTurns does not claim submission", async () => {
   const { e } = envWithModel(Array(10).fill({ action: "wait", value: "100" }));
   e.make("button", { text: "Apply", rect: { width: 100, height: 40 } });
@@ -267,6 +331,23 @@ test("openApplication falls back to an observed candidate when the platform hint
 
   assert.equal(result.opened, true);
   assert.equal(result.via.source, "observed");
+});
+
+test("openApplication skips a disabled apply control instead of clicking it", async () => {
+  // e.g. Naukri's bulk "Apply" on recommended jobs, disabled until jobs are ticked.
+  const { e } = envWithModel([]);
+  e.make("button", { text: "Apply", disabled: true, rect: { x: 0, y: 0, width: 100, height: 40 } });
+  const clicked = [];
+  const enabled = e.make("button", { text: "Apply now", rect: { x: 0, y: 60, width: 100, height: 40 } });
+  enabled.addEventListener("click", () => clicked.push("Apply now"));
+
+  const snapshot = e.sandbox.__autoApplyObserverCore.buildSnapshot({});
+  const result = await e.sandbox.__autoApplyAgentLoopCore.openApplication({
+    snapshot, opened: () => clicked.length > 0, settleMax: 300, openWaitMs: 300,
+  });
+
+  assert.equal(result.opened, true);
+  assert.equal(result.via.name, "Apply now");
 });
 
 test("openApplication reports when there is no apply control at all", async () => {

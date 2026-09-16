@@ -2,7 +2,17 @@
 
 /* global naukriScrape, naukriApply */
 
+const NAUKRI_MESSAGES = new Set([
+  "SCRAPE_PAGE", "NEXT_PAGE", "APPLY", "CONTINUE_APPLY", "OPEN_EXTERNAL_COMPANY_SITE", "PROBE",
+]);
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  // Leave every other message to its own listener. Several listeners share a
+  // Naukri tab, and the first reply wins: answering "unknown message" here
+  // beat the takeover listener's real, asynchronous reply to TAKEOVER_START
+  // and TAKEOVER_APPLY_HERE.
+  if (!NAUKRI_MESSAGES.has(msg?.type)) return false;
+
   (async () => {
     try {
       switch (msg.type) {
@@ -23,9 +33,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
         case "PROBE":
           return sendResponse({ ok: true, anomaly: naukriScrape.checkAnomaly() });
-
-        default:
-          return sendResponse({ ok: false, error: "unknown message " + msg.type });
       }
     } catch (err) {
       // Surface anomalies to the governor so it can trip the breaker.

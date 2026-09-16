@@ -392,6 +392,17 @@ export async function decideAction(snapshot, profile, askJSON, opts = {}) {
     JSON.stringify(candidateContext, null, 2),
   ];
 
+  // Which job this application is for. A company careers page can list many
+  // openings, each with its own Apply, and a form may ask for the position.
+  if (opts.job?.title) {
+    parts.push(
+      "",
+      "ApplyingFor:",
+      JSON.stringify({ title: opts.job.title, company: opts.job.company || null }),
+      "Act only on this job. If the page lists other openings but not this one, stop.",
+    );
+  }
+
   // Feedback from a previous action the website ignored. Without this the
   // model has no way to know its last choice was rejected and will repeat it.
   if (opts.lastFailure) {

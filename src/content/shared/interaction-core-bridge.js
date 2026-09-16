@@ -276,9 +276,20 @@
     let best = null;
     for (const cand of candidates) {
       const score = scoreCandidateMatch(expected, cand);
-      if (score >= threshold && (!best || score > best.score)) best = { id: cand.id, score };
+      if (score < threshold) continue;
+      // Equal scores mean identical-looking controls, such as one "Apply" per
+      // row of a job list; the nearest is the one we meant.
+      const distance = rectDistance(expected.rect, cand.rect);
+      if (!best || score > best.score || (score === best.score && distance < best.distance)) {
+        best = { id: cand.id, score, distance };
+      }
     }
-    return best;
+    return best && { id: best.id, score: best.score };
+  }
+
+  function rectDistance(a, b) {
+    if (!a || !b) return Infinity;
+    return Math.hypot((a.x || 0) - (b.x || 0), (a.y || 0) - (b.y || 0));
   }
 
   function detectSecurityChallenge(signals = {}) {

@@ -474,7 +474,23 @@ to a company ATS is driven by the generic adapter from that point on, because
 **New tabs.** A content script cannot see another tab, so when a job opens one
 the takeover asks the worker (`TAKEOVER_ADOPT_NEW_TAB`) to focus it, run the
 application there, and hand control back. The worker closes only the tab it
-adopted; the user's own tab is never closed.
+adopted; the user's own tab is never closed. If that tab ends on a challenge or
+a question, it is left open and in front instead, and the run ends.
+
+A click that opens a tab changes nothing on the clicked page, so it used to read
+as `ACTION_NO_EFFECT` and be retried, while the page, now hidden, had its
+timers throttled to about one per second. The worker therefore records which tab
+opened which (`chrome.tabs.onCreated`), and the executor asks it
+(`TAB_OPENED_SINCE`) whenever a click had no visible effect or the page went
+hidden. The click then reports `openedTab`, and the caller decides what to do:
+opening a job or an apply control follows the tab, and anything else the model
+clicked (a company profile, a reviews site) is closed via `CLOSE_OPENED_TAB`
+so the run carries on.
+
+The Naukri and LinkedIn message bridges answer only their own message types.
+Every listener in a tab sees every message and the first reply wins, so their
+old "unknown message" reply pre-empted `TAKEOVER_START` and
+`TAKEOVER_APPLY_HERE`.
 
 **Pacing is configurable** (`takeover.configure(...)`). Production keeps
 human-paced defaults; the tests collapse them, which is why the suite asserts

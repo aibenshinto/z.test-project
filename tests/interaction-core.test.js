@@ -250,6 +250,15 @@ test("an unlabelled field still re-resolves to its own replacement in the same p
   assert.equal(resolveLogicalTarget(expected, [same]).id, "element_5");
 });
 
+test("among identical controls, re-resolution picks the nearest, not the first", () => {
+  // One "Apply" per row of a job list: re-finding the third row's Apply must
+  // not land on the second row's.
+  const apply = (id, y) => ({ id, tag: "a", role: "link", text: "Apply", rect: { x: 900, y, width: 60, height: 20 } });
+  const expected = apply("element_3", 280);
+  const match = resolveLogicalTarget(expected, [apply("element_1", 120), apply("element_2", 200), apply("element_9", 282)]);
+  assert.equal(match.id, "element_9");
+});
+
 test("a named control never re-resolves to an unnamed one", () => {
   const expected = { tag: "button", role: "button", text: "Easy Apply", rect: { x: 0, y: 0, width: 100, height: 40 } };
   const unnamed = { id: "element_3", tag: "button", role: "button", text: "", rect: { x: 0, y: 0, width: 100, height: 40 } };

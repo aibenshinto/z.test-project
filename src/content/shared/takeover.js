@@ -132,9 +132,17 @@
         snapshot.page.applicationState === "unknown") {
       report({ phase: "apply", job: job?.title, note: "Looking for the apply button" });
 
+      // A company careers page often lists every opening with its own Apply.
+      // Only this job's Apply will do; the first one on the page is usually
+      // a different job.
+      const listed = adapter.name === "generic" ? applyControlForJob(job) : null;
+      if (listed && !listed.element) {
+        return { submitted: false, reason: `this page lists several jobs, but not "${job.title}"` };
+      }
+
       const opened = await loop().openApplication({
-        hint: platformApplyHint(),
-        snapshot,
+        hint: listed ? () => listed.element : platformApplyHint(),
+        snapshot: listed ? { ...snapshot, applyCandidates: [] } : snapshot,
         opened: () => applicationStarted(adapter),
         settleMax: TIMING.settleMax,
         openWaitMs: TIMING.openWaitMs,
@@ -144,11 +152,24 @@
       if (!opened.opened) {
         return { submitted: false, reason: opened.reason, tried: opened.tried };
       }
+
+      // The apply control opened the application in a new tab (usually the
+      // company's own site). Follow it there.
+      if (opened.newTab) return followOpenedApplication(opened.newTab, job);
     }
 
     // Hand the form itself to the shared agent loop.
     report({ phase: "form", job: job?.title, note: "Filling the application" });
-    return loop().run(adapter, { maxTurns: 30 });
+    const outcome = await loop().run(adapter, { maxTurns: 30, job });
+
+    // An apply control part-way through the form moved it to a new tab.
+    if (outcome.newTab) return followOpenedApplication(outcome.newTab, job);
+    return outcome;
+  }
+
+  async function followOpenedApplication(tab, job) {
+    return (await followNewTab({ tabId: tab.id, job })) ||
+      { submitted: false, reason: "the application opened in a new tab that closed before it could be followed" };
   }
 
   /** Has an application actually started on this page? */
@@ -169,6 +190,61 @@
         .find((el) => obs().isVisible(el)) || null;
     }
     return undefined;
+  }
+
+  // -------------------------------------------------------------------------
+  // Pages that list several jobs
+  // -------------------------------------------------------------------------
+
+  const APPLY_NAME = /^(?:apply|apply now|apply here|apply online|quick apply|easy apply)$/i;
+  const TITLE_NOISE = new Set(["and", "for", "the", "with", "of", "in", "to", "at", "or", "job", "role", "level", "years", "year", "yrs", "yr"]);
+
+  function titleWords(text) {
+    return String(text || "").toLowerCase().split(/[^a-z0-9+#]+/)
+      .filter((w) => w.length > 1 && !/^\d+$/.test(w) && !TITLE_NOISE.has(w));
+  }
+
+  /** Share of the job title's words that appear in `text`, 0..1. */
+  function titleMatch(title, text) {
+    const wanted = titleWords(title);
+    const have = new Set(titleWords(text));
+    return wanted.length ? wanted.filter((w) => have.has(w)).length / wanted.length : 0;
+  }
+
+  /**
+   * On a page listing several jobs, each with its own Apply, find the Apply
+   * in the row that names this job.
+   *
+   * @returns {null | {element: Element|null}}  null when the page is not such
+   *   a list; `element` is null when the list does not include this job.
+   */
+  function applyControlForJob(job) {
+    if (!job?.title) return null;
+    const controls = [...document.querySelectorAll("a, button, [role='button'], input[type='submit'], input[type='button']")]
+      .filter((el) => obs().isVisible(el) && APPLY_NAME.test(core().accessibleName(obs().describe(el))));
+    if (controls.length < 2) return null;
+
+    // The job's own page may repeat its Apply at the top and bottom; a page
+    // headed with this job's title is not a list of other jobs.
+    const heading = [document.title, ...[...document.querySelectorAll("h1")].map((h) => obs().innerText(h))].join(" ");
+    if (titleMatch(job.title, heading) >= 0.6) return null;
+
+    let best = null;
+    for (const control of controls) {
+      const score = titleMatch(job.title, obs().innerText(rowFor(control, controls)));
+      if (!best || score > best.score) best = { control, score };
+    }
+    return { element: best.score >= 0.6 ? best.control : null };
+  }
+
+  /** The largest ancestor of `control` holding no other listed control: its row. */
+  function rowFor(control, controls) {
+    let row = control;
+    while (row.parentElement && row.parentElement !== document.body &&
+           !controls.some((other) => other !== control && row.parentElement.contains(other))) {
+      row = row.parentElement;
+    }
+    return row;
   }
 
   // -------------------------------------------------------------------------
@@ -260,8 +336,21 @@
           if (applied.length + skipped.length >= maxJobs) break;
 
           visited.add(job.id);
+
+          // Only jobs that fit the candidate's profile are opened at all.
+          const fit = await checkFit(job);
+          if (fit.error) {
+            return { ...summarize(applied, skipped, fit.error), ok: false, error: fit.error };
+          }
+          if (fit.decision !== "APPLY") {
+            skipped.push({ ...stripJob(job), reason: fit.reason });
+            report({ phase: "skip", job: job.title, note: fit.reason });
+            continue;
+          }
+
           report({ phase: "open", job: job.title, company: job.company, note: `Opening "${job.title.slice(0, 50)}"` });
 
+          const clickedAt = Date.now();
           const opened = await walker().openJob(
             job,
             () => !onResultsPage() || applicationAvailable(),
@@ -269,11 +358,15 @@
           );
 
           // A job that opened in a NEW tab cannot be driven from here: a
-          // content script only sees its own tab. Ask the worker to run it
-          // there and report back.
-          const adopted = await adoptNewTabIfAny();
-          if (adopted.adopted) {
-            recordOutcome(adopted.result || { submitted: false, reason: adopted.error }, job, applied, skipped);
+          // content script only sees its own tab. The worker runs it there and
+          // reports back. `since` also catches a tab that appeared too late
+          // for the click itself to notice.
+          const followed = await followNewTab({ tabId: opened.newTab?.id, since: clickedAt, job: stripJob(job) }) ||
+            (opened.newTab && { submitted: false, reason: "the job's new tab closed before the agent could follow it" });
+          if (followed) {
+            recordOutcome(followed, job, applied, skipped);
+            const ended = endOfRun(followed, applied, skipped);
+            if (ended) return ended;
             await sleep(TIMING.betweenJobs);
             continue;
           }
@@ -289,14 +382,8 @@
           const outcome = await applyToOpenJob(job);
           recordOutcome(outcome, job, applied, skipped);
 
-          // A security challenge or a question for the user ends the run with
-          // the page left where they can see and act on it.
-          if (outcome.blocked || outcome.stopped) {
-            return summarize(applied, skipped, outcome.reason, { blocked: true });
-          }
-          if (outcome.waitingForUser) {
-            return summarize(applied, skipped, outcome.question, { waitingForUser: true, question: outcome.question });
-          }
+          const ended = endOfRun(outcome, applied, skipped);
+          if (ended) return ended;
 
           if (!(await returnToResults(resultsUrl))) {
             return summarize(applied, skipped, "could not get back to the results list");
@@ -317,16 +404,57 @@
   }
 
   /**
-   * If the last click opened a new tab, hand that tab to the worker to drive.
-   * Returns { adopted: false } when nothing new opened, which is the usual case.
+   * A security challenge or a question for the user ends the run with the
+   * page left where they can see and act on it — whichever tab that is.
+   * Returns the run summary, or null when the run should carry on.
    */
-  async function adoptNewTabIfAny() {
+  function endOfRun(outcome, applied, skipped) {
+    if (outcome.blocked || outcome.stopped) {
+      return summarize(applied, skipped, outcome.reason, { blocked: true });
+    }
+    if (outcome.waitingForUser) {
+      return summarize(applied, skipped, outcome.question, { waitingForUser: true, question: outcome.question });
+    }
+    return null;
+  }
+
+  /**
+   * Hand a tab this page opened to the worker, which focuses it, runs the
+   * application there and reports back.
+   *
+   * @param {object} which
+   * @param {number} [which.tabId]  A tab the click is known to have opened
+   * @param {number} [which.since]  Otherwise, any tab this page opened after this time (ms)
+   * @param {object} [which.job]    The job being applied for, so the new page knows
+   * @returns {Promise<object|null>} The application outcome, or null when no tab was opened
+   */
+  async function followNewTab({ tabId, since, job }) {
     try {
-      const res = await chrome.runtime.sendMessage({ type: "TAKEOVER_ADOPT_NEW_TAB" });
-      if (res?.adopted) report({ phase: "external", note: "Continuing in the company's own tab" });
-      return res || { adopted: false };
+      const res = await chrome.runtime.sendMessage({
+        type: "TAKEOVER_ADOPT_NEW_TAB", tabId, since, job: job ? stripJob(job) : null,
+      });
+      if (!res?.adopted) return null;
+      report({ phase: "external", note: "Continued in the new tab" });
+      return res.result || { submitted: false, reason: res.error || "the new tab did not report a result" };
     } catch (_) {
-      return { adopted: false };
+      return null;
+    }
+  }
+
+  /**
+   * Ask the worker whether this job fits the candidate's profile, from what
+   * its results card shows.
+   * @returns {Promise<{decision: string, reason: string} | {error: string}>}
+   */
+  async function checkFit(job) {
+    try {
+      const res = await chrome.runtime.sendMessage({
+        type: "TAKEOVER_EVALUATE_JOB", job: { ...stripJob(job), text: job.text || "" },
+      });
+      if (!res?.ok) return { error: res?.error || "could not check this job against your profile" };
+      return { decision: res.decision, reason: res.reason || "" };
+    } catch (err) {
+      return { error: `could not check this job against your profile: ${String(err?.message || err)}` };
     }
   }
 
@@ -397,7 +525,7 @@
         // The worker followed a job into this tab and wants the application
         // completed here, then control handed back.
         cursor()?.show();
-        applyToOpenJob(null)
+        applyToOpenJob(msg.job || null)
           .then((r) => sendResponse(r))
           .catch((err) => sendResponse({ submitted: false, reason: String(err?.message || err) }));
         return true;

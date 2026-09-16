@@ -92,6 +92,9 @@
         url: href,
         title,
         company: companyFor(card, title),
+        // The whole card (experience, location, skills, summary), so the
+        // job can be checked against the candidate's profile before opening.
+        text: obs().innerText(card).slice(0, 2000),
         element: card,
         link,
         rect: obs().rectOf(card),
@@ -117,12 +120,16 @@
     }
   }
 
-  /** Best-effort company name from the card text, excluding the title itself. */
+  /**
+   * Best-effort company name: the first line of the card after the title.
+   * Uses the raw innerText, whose line breaks separate the card's fields.
+   */
   function companyFor(card, title) {
-    const text = obs().innerText(card);
+    const text = String(card?.innerText || card?.textContent || "");
     if (!text) return "";
-    const rest = text.replace(title, " ").replace(/\s+/g, " ").trim();
-    return rest.split(/[·|•\n]/)[0].trim().slice(0, 80);
+    return text.replace(title, "\n").split(/[·|•\n]/)
+      .map((line) => line.replace(/\s+/g, " ").trim())
+      .find(Boolean)?.slice(0, 80) || "";
   }
 
   // -------------------------------------------------------------------------
@@ -148,10 +155,25 @@
       return { opened: false, reason: "the job card is no longer on the page" };
     }
 
-    const id = obs().registerElement(target, obs().describe(target));
     globalThis.__autoApplyCursor?.setNote(`Opening "${job.title.slice(0, 50)}"`);
 
+    // A job link that opens in a new tab is opened through the worker. To
+    // Chrome, a scripted click on a target=_blank link is a pop-up, blocked
+    // once the user's last real click on the page is a few seconds old — so
+    // only the first job or two of a run would ever open.
+    if (target === job.link && /^_blank$/i.test(job.link.getAttribute?.("target") || "")) {
+      const tab = await openInNewTab(job.link, job.url);
+      if (tab) return { opened: true, newTab: tab };
+    }
+
+    const id = obs().registerElement(target, obs().describe(target));
     const result = await exec.click(id, { settleMax: opts.settleMax ?? 3000 });
+
+    // Many boards open the job detail in a new tab. This page will not
+    // change, so waiting for `opened()` here would only burn the timeout.
+    if (result.openedTab) {
+      return { opened: true, newTab: result.openedTab, clickResult: result };
+    }
 
     // The click may be CONFIRMED while the detail has not rendered yet.
     const deadline = Date.now() + (opts.openWaitMs ?? 4000);
@@ -160,11 +182,39 @@
       await new Promise((r) => setTimeout(r, 150));
     }
 
+    // Nothing opened. A board that opens jobs from a click handler hits the
+    // same pop-up block, so fall back to opening the job's own URL.
+    if (result.result !== core().ACTION_RESULT.CONFIRMED && job.url) {
+      const tab = await openInNewTab(target, job.url);
+      if (tab) return { opened: true, newTab: tab, clickResult: result };
+    }
+
     return {
       opened: false,
       reason: `clicked "${job.title.slice(0, 60)}" but the job detail did not appear`,
       clickResult: result,
     };
+  }
+
+  /**
+   * Ask the worker to open `url` in a new tab beside this one. The cursor
+   * still travels to the link, so the user sees which job is being opened.
+   * @returns {Promise<{id, url}|null>}
+   */
+  async function openInNewTab(el, url) {
+    try {
+      await globalThis.__autoApplyPointer?.scrollIntoView(el);
+      const r = el.getBoundingClientRect();
+      await globalThis.__autoApplyCursor?.moveTo(Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2));
+      globalThis.__autoApplyCursor?.flashClick();
+    } catch (_) { /* cosmetic only */ }
+
+    try {
+      const res = await chrome.runtime.sendMessage({ type: "OPEN_TAB_FROM_PAGE", url });
+      return res?.ok && res.tab?.id ? res.tab : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   // -------------------------------------------------------------------------

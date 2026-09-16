@@ -60,9 +60,15 @@
     // settleMax still costs the full default wait.
     if (min == null) min = Math.min(350, Math.round(max / 2));
     const started = Date.now();
+    const wasHidden = pageHidden();
     await sleep(min);
 
     while (Date.now() - started < max) {
+      // The page went into the background — typically the click opened a new
+      // tab. Nothing here will change, and a hidden page's timers are
+      // throttled to about one per second, so stop waiting.
+      if (!wasHidden && pageHidden()) return obs().fingerprint();
+
       const now = obs().fingerprint();
       // Return early only on a structural change — the same bar the outcome
       // classifier uses. Text drifting on its own must not cut the wait short
@@ -76,6 +82,32 @@
       await sleep(150);
     }
     return obs().fingerprint();
+  }
+
+  function pageHidden() {
+    return document.visibilityState === "hidden";
+  }
+
+  // -------------------------------------------------------------------------
+  // New tabs
+  // -------------------------------------------------------------------------
+
+  /**
+   * Did this page open a new tab since `since`?
+   *
+   * A click on a target=_blank link changes nothing on this page, so without
+   * asking, it reads as "no effect" and the click is retried — opening the
+   * tab again. Only the worker can see other tabs.
+   *
+   * @returns {Promise<{id, url}|null>}
+   */
+  async function tabOpenedSince(since, waitMs = 0) {
+    try {
+      const res = await chrome.runtime.sendMessage({ type: "TAB_OPENED_SINCE", since, waitMs });
+      return res?.opened && res.tab?.id ? res.tab : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -134,6 +166,7 @@
     const settleMax = opts.settleMax ?? 2000;
     const wantDouble = Boolean(opts.double);
     const attempts = [];
+    const startedAt = Date.now();
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       const resolved = resolveTarget(id);
@@ -199,6 +232,21 @@
         beforeState: summarize(before),
         afterState: summarize(after),
       });
+
+      // A hidden page means focus moved to a new tab; the record of that tab
+      // can lag the switch slightly, so allow it a moment to arrive.
+      const hidden = pageHidden();
+      if (hidden || outcome.result !== core().ACTION_RESULT.CONFIRMED) {
+        const openedTab = await tabOpenedSince(startedAt, hidden ? 1500 : 0);
+        if (openedTab) {
+          const last = attempts[attempts.length - 1];
+          last.result = RESULT.CONFIRMED;
+          last.changes = [...(last.changes || []), "newTab"];
+          last.reason = `the click opened ${openedTab.url || "a page"} in a new tab`;
+          log(`[VERIFY] ${last.reason}`);
+          return finish(id, RESULT.CONFIRMED, attempts, { meta, before, after, changes: last.changes, openedTab });
+        }
+      }
 
       if (outcome.result === core().ACTION_RESULT.CONFIRMED) {
         log(`[VERIFY] ${outcome.reason}`);
@@ -271,6 +319,9 @@
       // New fields.
       result,
       changes: extra.changes || [],
+      // Set when the click opened a new tab; the caller decides whether to
+      // follow it or close it.
+      openedTab: extra.openedTab || null,
       diagnostics: record,
     };
   }
