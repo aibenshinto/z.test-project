@@ -276,12 +276,37 @@ function findExternalButton() {
   }) || null;
 }
 
+async function persistApplyTrace(entry) {
+  const { applyTrace = [] } = await chrome.storage.local.get("applyTrace");
+  applyTrace.push({
+    at: Date.now(),
+    ...entry
+  });
+  await chrome.storage.local.set({
+    applyTrace: applyTrace.slice(-100)
+  });
+}
+
 /**
- * Drive one application to completion.
- * Resolves { submitted, answered, reason } - `submitted` is authoritative and
+ * Executes a single job application attempt.
+ * Relies entirely on DOM state, making it stateless between restarts.
+ * Returns { submitted: boolean, answered: Question[], reason?: string }
+ *
+ * CRITICAL: do not throw on expected errors (profile incomplete, navigation).
+ * Return an object so the engine can record the outcome. Throw only for
+ * critical unexpected states that should halt the entire loop.
+ *
+ * It is vital that this function never returns { submitted: true } unless
+ * the DOM proves it. If uncertain, return false. False positives destroy
+ * the integrity of the run; false negatives just mean we try again or skip.
+ * Therefore, "did the UI change?" is not enough. The final confirmation is
  * derived only from page state.
  */
 async function apply(job) {
+  const traceEntry = { stage: "apply.js_entry", site: job?.site, jobId: job?.id, title: job?.title, company: job?.company };
+  console.log("[APPLY_TRACE]", JSON.stringify(traceEntry));
+  await persistApplyTrace(traceEntry);
+  const S = NAUKRI_SEL;
   const anomaly = naukriScrape.checkAnomaly();
   if (anomaly) throw new Error(anomaly);
 
@@ -329,15 +354,34 @@ async function apply(job) {
   }
 
   const opened = await openApplicationDrawer();
-  if (!opened.ok) return { submitted: false, answered: [], blocked: opened.blocked, reason: opened.reason };
-  if (opened.submitted) return { submitted: true, answered: [], reason: "already applied" };
+  if (!opened.ok) {
+    const res = { submitted: false, answered: [], blocked: opened.blocked, reason: opened.reason };
+    const traceFail = { stage: "apply.js_openDrawer_fail", result: res };
+    console.log("[APPLY_TRACE]", JSON.stringify(traceFail));
+    await persistApplyTrace(traceFail);
+    return res;
+  }
+  if (opened.submitted) {
+    const res = { submitted: true, answered: [], reason: "already applied" };
+    const traceOk = { stage: "apply.js_openDrawer_submitted", result: res };
+    console.log("[APPLY_TRACE]", JSON.stringify(traceOk));
+    await persistApplyTrace(traceOk);
+    return res;
+  }
 
   // Route to the correct application path based on what openApplicationDrawer detected.
   // This avoids a second DOM walk and is immune to race conditions between
   // the drawer click and the questionnaire panel animating in.
   const mode = opened.mode || detectApplicationMode();
   if (mode === "agent") {
-    return naukriAgentLoop.runAgentLoop({ resumeFile });
+    const traceAgentStart = { stage: "apply.js_agent_loop_start" };
+    console.log("[APPLY_TRACE]", JSON.stringify(traceAgentStart));
+    await persistApplyTrace(traceAgentStart);
+    const res = await naukriAgentLoop.runAgentLoop({ resumeFile });
+    const traceAgentEnd = { stage: "apply.js_agent_loop_end", result: res };
+    console.log("[APPLY_TRACE]", JSON.stringify(traceAgentEnd));
+    await persistApplyTrace(traceAgentEnd);
+    return res;
   }
 
   const answered = [];
@@ -386,11 +430,15 @@ async function apply(job) {
     }
   }
 
-  return {
+  const res = {
     submitted: naukriApplicationSubmitted(),
     answered,
     reason: "drawer did not confirm submission within 15 turns",
   };
+  const traceFallback = { stage: "apply.js_fallback_finished", result: res };
+  console.log("[APPLY_TRACE]", JSON.stringify(traceFallback));
+  await persistApplyTrace(traceFallback);
+  return res;
 }
 
 async function loadContext() {
