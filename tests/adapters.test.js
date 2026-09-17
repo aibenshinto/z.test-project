@@ -361,3 +361,40 @@ test("element IDs are reassigned on each observation and never reused across pag
   assert.equal(first, "element_1");
   assert.equal(second, "element_1", "the registry resets each observation");
 });
+
+// ---------------------------------------------------------------------------
+// Forms that are not applications
+// ---------------------------------------------------------------------------
+
+test("a careers page whose only form is a contact form has no application on it", () => {
+  // Taken from a real company page a Naukri external apply leads to: a job
+  // description and a WordPress contact form, with no way to apply and
+  // nowhere to attach a CV. Reading that form as the application left the
+  // agent filling it in turn after turn, and would have sent the company a
+  // message rather than an application.
+  const e = createEnvironment({ scripts: GENERIC, url: "https://acme.test/jr-python-developer/" });
+  e.make("h1", { text: "Jr Python Developer / Software Engineer", rect: { width: 600, height: 40 } });
+
+  const form = e.make("form", { rect: { x: 0, y: 300, width: 600, height: 400 } });
+  e.make("input", { type: "text", "aria-label": "Your name", rect: { width: 300, height: 30 } }, form);
+  e.make("input", { type: "email", "aria-label": "Your email", rect: { width: 300, height: 30 } }, form);
+  e.make("input", { type: "text", "aria-label": "Subject", rect: { width: 300, height: 30 } }, form);
+  e.make("textarea", { "aria-label": "Your message", rect: { width: 300, height: 120 } }, form);
+  e.make("input", { type: "submit", value: "Submit", rect: { width: 100, height: 36 } }, form);
+
+  assert.equal(e.sandbox.genericObserver.findApplicationRoot(), null,
+    "a name/email/subject/message form is a contact form, not an application");
+  assert.equal(e.sandbox.genericObserver.observe().page.applicationState, "unknown",
+    "with no application and no apply control, the page state is unknown so the job is skipped");
+});
+
+test("a form that takes a CV is the application, even worded plainly", () => {
+  const e = createEnvironment({ scripts: GENERIC, url: "https://acme.test/careers/1" });
+  const form = e.make("form", { rect: { x: 0, y: 0, width: 800, height: 600 } });
+  e.make("input", { type: "text", "aria-label": "Your name", rect: { width: 300, height: 30 } }, form);
+  e.make("input", { type: "email", "aria-label": "Your email", rect: { width: 300, height: 30 } }, form);
+  e.make("input", { type: "file", "aria-label": "Upload your CV", rect: { width: 300, height: 30 } }, form);
+
+  assert.equal(e.sandbox.genericObserver.findApplicationRoot(), form);
+  assert.equal(e.sandbox.genericObserver.observe().page.applicationState, "applying");
+});

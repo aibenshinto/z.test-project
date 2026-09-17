@@ -233,19 +233,25 @@
         afterState: summarize(after),
       });
 
-      // A hidden page means focus moved to a new tab; the record of that tab
-      // can lag the switch slightly, so allow it a moment to arrive.
+      // Always ask, even when this page reacted: one click can do both. A job
+      // board's apply control opens the company's application in a new tab
+      // AND sends this tab to its own record of the click — a page with
+      // nothing to apply with. Reading that as "the click worked, carry on
+      // here" leaves the real application sitting untouched in the other tab.
+      //
+      // A hidden page means focus moved to the new tab, and a navigation here
+      // means the click did something wholesale; the record of the new tab can
+      // lag either, so allow it a moment to arrive.
       const hidden = pageHidden();
-      if (hidden || outcome.result !== core().ACTION_RESULT.CONFIRMED) {
-        const openedTab = await tabOpenedSince(startedAt, hidden ? 1500 : 0);
-        if (openedTab) {
-          const last = attempts[attempts.length - 1];
-          last.result = RESULT.CONFIRMED;
-          last.changes = [...(last.changes || []), "newTab"];
-          last.reason = `the click opened ${openedTab.url || "a page"} in a new tab`;
-          log(`[VERIFY] ${last.reason}`);
-          return finish(id, RESULT.CONFIRMED, attempts, { meta, before, after, changes: last.changes, openedTab });
-        }
+      const navigated = (outcome.changes || []).includes("url");
+      const openedTab = await tabOpenedSince(startedAt, hidden ? 1500 : navigated ? 1000 : 0);
+      if (openedTab) {
+        const last = attempts[attempts.length - 1];
+        last.result = RESULT.CONFIRMED;
+        last.changes = [...(last.changes || []), "newTab"];
+        last.reason = `the click opened ${openedTab.url || "a page"} in a new tab`;
+        log(`[VERIFY] ${last.reason}`);
+        return finish(id, RESULT.CONFIRMED, attempts, { meta, before, after, changes: last.changes, openedTab });
       }
 
       if (outcome.result === core().ACTION_RESULT.CONFIRMED) {

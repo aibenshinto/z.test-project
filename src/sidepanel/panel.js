@@ -564,9 +564,17 @@ if ($("takeoverStart")) {
           renderJobList(result.skipped, "Not submitted");
       }
     } catch (err) {
-      $("takeoverStatus").textContent =
-        `The page stopped responding: ${String(err?.message || err)}. ` +
-        `If it navigated away, reload and take over again.`;
+      // The run lives in the page's own scripts, so the page leaving takes the
+      // run with it. A job board does exactly that when its apply control
+      // sends the tab to the company's site or to its own record of the click.
+      const message = String(err?.message || err);
+      const navigatedAway =
+        /message channel closed|Receiving end does not exist|context invalidated/i.test(message);
+      $("takeoverStatus").textContent = navigatedAway
+        ? "The page navigated away and the run stopped with it — a job board does this when " +
+          "Apply sends the tab elsewhere. Jobs already applied to are recorded. Go back to the " +
+          "results list and take over again to carry on."
+        : `The page stopped responding: ${message}. If it navigated away, reload and take over again.`;
     } finally {
       setTakeoverRunning(false);
       renderDiagnostics();

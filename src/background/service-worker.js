@@ -10,7 +10,7 @@ import { modelRerank } from "../lib/ranker.js";
 import { askJSON } from "../lib/llm/index.js";
 import { emptySession, transition, STATES } from "../lib/agent-fsm.js";
 import { info, warn, getLog } from "../lib/logger.js";
-import { platformFromJob, platformFromUrl } from "../lib/platforms.js";
+import { platformFromJob, platformFromUrl, isApplicationReceiptUrl } from "../lib/platforms.js";
 import { profileHintForQuestion } from "../lib/questions.js";
 import { decideAction, buildCandidateContext } from "../lib/ui-agent.js";
 import {
@@ -78,6 +78,12 @@ chrome.tabs.onRemoved.addListener((tabId) => openedTabs.delete(tabId));
 /**
  * The most recent still-open tab that `openerTabId` opened at or after
  * `since`, waiting up to `waitMs` for its creation event to arrive.
+ *
+ * One click can open two tabs: Naukri's "Apply on company site" opens the
+ * company's page and its own receipt page. The receipt is never the
+ * application, so it is passed over while any other candidate exists — and
+ * taken only when it is the only thing that opened, so the caller can say
+ * what happened.
  */
 async function tabOpenedBy(openerTabId, since, waitMs = 0) {
   const deadline = Date.now() + Math.min(Number(waitMs) || 0, 5000);
@@ -85,14 +91,32 @@ async function tabOpenedBy(openerTabId, since, waitMs = 0) {
     const candidates = [...openedTabs.values()]
       .filter((t) => t.openerTabId === openerTabId && t.createdAt >= since)
       .sort((a, b) => b.createdAt - a.createdAt);
+
+    let receipt = null;
     for (const { id } of candidates) {
       const tab = await chrome.tabs.get(id).catch(() => null);
-      if (tab) return tab;
-      openedTabs.delete(id);
+      if (!tab) {
+        openedTabs.delete(id);
+        continue;
+      }
+      if (isApplicationReceiptUrl(tab.pendingUrl || tab.url || "")) {
+        receipt = receipt || tab;
+        continue;
+      }
+      return tab;
     }
-    if (Date.now() >= deadline) return null;
+    if (Date.now() >= deadline) return receipt;
     await new Promise((r) => setTimeout(r, 100));
   }
+}
+
+/**
+ * Close a job board's receipt page once it has loaded and recorded the click.
+ * Failing to close it is not worth failing an application over.
+ */
+async function closeReceiptTab(tabId) {
+  await waitForTab(tabId).catch(() => {});
+  await chrome.tabs.remove(tabId).catch(() => {});
 }
 
 /**
@@ -102,13 +126,28 @@ async function tabOpenedBy(openerTabId, since, waitMs = 0) {
  * Apply on a job board often sends the same tab on to the company's own site.
  * That unloads the page mid-application and closes the message channel; the
  * new page has its own content scripts, so pick up again there.
+ *
+ * `depth` guards the one hand-off this makes for itself, from a board's
+ * receipt page to the application the same click opened elsewhere.
  */
-async function applyInTab(tabId, job) {
+async function applyInTab(tabId, job, depth = 0) {
   // Multi-page ATS flows (Workday, Taleo) load a new page per step.
   const MAX_PAGES = 10;
+  const startedAt = Date.now();
   let lastError = null;
   for (let page = 0; page < MAX_PAGES; page++) {
     await waitForTab(tabId);
+
+    // The board sent this tab to its own record of the click. There is
+    // nothing to apply with here; the application is in the tab the same
+    // click opened.
+    const here = await chrome.tabs.get(tabId).catch(() => null);
+    if (here && isApplicationReceiptUrl(here.pendingUrl || here.url || "")) {
+      if (depth > 0) {
+        return { submitted: false, reason: "the job board recorded the apply click, but no application page opened" };
+      }
+      return followReceipt(tabId, job, startedAt);
+    }
 
     // The shared scripts are declared for https://*/* so they are already
     // present; this only covers a tab that loaded too early.
@@ -129,6 +168,38 @@ async function applyInTab(tabId, job) {
     }
   }
   return { submitted: false, reason: `the application kept moving between pages (${lastError})` };
+}
+
+/**
+ * This tab is showing a board's receipt for an apply click. Carry the
+ * application on in the tab that same click opened, and close the receipt.
+ *
+ * The board has recorded the click by now, but that is not an application:
+ * it still has to be completed on the company's own site.
+ */
+async function followReceipt(tabId, job, since) {
+  const application = await tabOpenedBy(tabId, since, 3000);
+  if (!application || isApplicationReceiptUrl(application.pendingUrl || application.url || "")) {
+    return {
+      submitted: false,
+      reason: "the job board recorded the apply click, but did not open an application to fill in",
+    };
+  }
+
+  await info("The job board recorded the click; continuing in the company's own tab", {
+    url: application.pendingUrl || application.url,
+  });
+  await chrome.tabs.update(application.id, { active: true }).catch(() => {});
+  await closeReceiptTab(tabId);
+
+  const result = await applyInTab(application.id, job, 1);
+
+  // A challenge or a question for the user ends the run in the tab they need
+  // to act in, so that one stays open and in front.
+  if (!(result?.blocked || result?.stopped || result?.waitingForUser)) {
+    await chrome.tabs.remove(application.id).catch(() => {});
+  }
+  return result;
 }
 
 /** Shape a results card, read as plain text, for the evaluator. */
@@ -1084,10 +1155,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // The exact tab the click opened, or else one this page opened since
         // the click. Never an older tab: the user may have opened jobs of
         // their own from the same results page.
+        // One click can open two tabs, and the second can arrive a moment
+        // after the first, so wait rather than take whatever exists now:
+        // picking the board's receipt page over the application costs the
+        // whole job.
         const adopted = msg.tabId != null
           ? await childTab(sourceTabId, msg.tabId)
           : msg.since != null
-            ? await tabOpenedBy(sourceTabId, Number(msg.since))
+            ? await tabOpenedBy(sourceTabId, Number(msg.since), 1500)
             : null;
 
         if (!adopted) return sendResponse({ ok: true, adopted: false });

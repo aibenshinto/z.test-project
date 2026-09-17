@@ -522,3 +522,53 @@ test("the fingerprint is stable when nothing changes", () => {
   const b = e.sandbox.__autoApplyObserverCore.fingerprint();
   assert.equal(e.sandbox.__autoApplyInteractionCore.diffPageState(a, b).changed, false);
 });
+
+// ---------------------------------------------------------------------------
+// Clicks that open a tab
+// ---------------------------------------------------------------------------
+
+test("a click that navigates this page AND opens a tab reports the new tab", async () => {
+  // Naukri's "Apply on company site" does both at once: the company's
+  // application opens in a new tab, and this tab is sent to Naukri's own
+  // record of the click. Treating the navigation as the whole story left the
+  // agent working on that record — a page with nothing to apply with — while
+  // the real application sat untouched in the other tab.
+  const e = env({ url: "https://www.naukri.com/job-listings-python-developer-acme-1" });
+  const asked = [];
+  e.sandbox.chrome.runtime.sendMessage = async (msg) => {
+    asked.push(msg);
+    return msg.type === "TAB_OPENED_SINCE"
+      ? { ok: true, opened: true, tab: { id: 42, url: "https://acme.test/jr-python-developer/" } }
+      : { ok: true };
+  };
+
+  const btn = e.make("button", { text: "Apply on company site", rect: { x: 500, y: 300, width: 180, height: 40 } });
+  btn.addEventListener("click", () => {
+    e.sandbox.location.href = "https://www.naukri.com/myapply/showAcp?jquery=1&file=301025501137";
+  });
+
+  const id = e.sandbox.__autoApplyObserverCore.buildSnapshot({}).elements[0].id;
+  const result = await e.sandbox.__autoApplyExecutorCore.click(id, { settleMax: 400 });
+
+  assert.equal(result.result, "ACTION_CONFIRMED");
+  assert.equal(result.openedTab?.id, 42, "the caller must be told where the application actually went");
+  assert.ok(asked.some((m) => m.type === "TAB_OPENED_SINCE"),
+    "a click that navigated must still ask whether it opened a tab");
+});
+
+test("a click that changes only this page reports no opened tab", async () => {
+  const e = env();
+  e.sandbox.chrome.runtime.sendMessage = async () => ({ ok: true, opened: false });
+
+  const btn = e.make("button", { text: "Easy Apply", rect: { x: 500, y: 300, width: 120, height: 40 } });
+  btn.addEventListener("click", () => {
+    const modal = e.make("div", { role: "dialog", rect: { x: 100, y: 100, width: 600, height: 400 } });
+    e.make("input", { type: "text", "aria-label": "Phone", rect: { width: 200, height: 30 } }, modal);
+  });
+
+  const id = e.sandbox.__autoApplyObserverCore.buildSnapshot({}).elements[0].id;
+  const result = await e.sandbox.__autoApplyExecutorCore.click(id, { settleMax: 400 });
+
+  assert.equal(result.result, "ACTION_CONFIRMED");
+  assert.equal(result.openedTab, null);
+});

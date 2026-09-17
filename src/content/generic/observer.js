@@ -20,9 +20,23 @@
   // Application root
   // -------------------------------------------------------------------------
 
+  // A form is the application only when something about it says so: a control
+  // to attach a CV, or wording that names an application. A careers page
+  // carries other forms — contact, enquiry, newsletter, search — and one of
+  // those asks for a name and an email just as an application does. Taking a
+  // contact form for the application is worse than finding nothing: the agent
+  // sits filling it in, and sends the company a message instead of applying.
+  const APPLICATION_WORDING = /application|apply|candidate|resume|cv|cover letter/i;
+
+  function looksLikeApplication(form) {
+    if (form.querySelector("input[type='file']")) return true;
+    return APPLICATION_WORDING.test(core().innerText(form).slice(0, 1500));
+  }
+
   /**
    * Prefer the subtree that holds the application form, so the model is not
-   * shown an entire marketing page. Falls back to the whole body.
+   * shown an entire marketing page. Returns null when this page has no
+   * application on it, which the caller reports rather than guessing.
    */
   function findApplicationRoot() {
     const isVisible = core().isVisible;
@@ -41,11 +55,7 @@
       .sort((a, b) => b.querySelectorAll("input,textarea,select").length -
                       a.querySelectorAll("input,textarea,select").length);
 
-    const appForm = forms.find((f) =>
-      /application|apply|candidate|resume|cv/i.test(core().innerText(f).slice(0, 1500)));
-    if (appForm) return appForm;
-
-    return forms.find((f) => f.querySelectorAll("input,textarea,select").length >= 2) || null;
+    return forms.find(looksLikeApplication) || null;
   }
 
   // -------------------------------------------------------------------------
