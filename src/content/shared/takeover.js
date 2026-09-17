@@ -582,6 +582,16 @@
   })();
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    // The cursor is drawn by each frame in its own document, so every frame
+    // acts on this one. Only the page answers, so the panel still gets a
+    // single reply.
+    if (msg.type === "SET_CURSOR_VISIBLE") {
+      cursor()?.setEnabled(msg.visible !== false);
+      if (!isTopFrame) return false;
+      sendResponse({ ok: true });
+      return false;
+    }
+
     if (Boolean(msg.toFrame) === isTopFrame) return false;
 
     switch (msg.type) {
@@ -606,11 +616,6 @@
 
       case "TAKEOVER_STATUS":
         sendResponse({ ok: true, running: isRunning(), url: location.href });
-        return false;
-
-      case "SET_CURSOR_VISIBLE":
-        cursor()?.setEnabled(msg.visible !== false);
-        sendResponse({ ok: true });
         return false;
 
       case "TAKEOVER_PROBE":

@@ -802,3 +802,25 @@ test("a page whose frames hold no application reports that, rather than the fram
   assert.equal(result.submitted, false);
   assert.match(result.reason, /no control that starts an application/i);
 });
+
+test("hiding the agent cursor hides it in embedded frames too", () => {
+  // The cursor is drawn by each frame in its own document, so a frame that
+  // ignored this would keep drawing one after the user turned it off.
+  const url = "https://acme.test/careers/1";
+  const top = createEnvironment({ scripts: scriptsFor("acme.test"), url });
+  const frame = createEnvironment({ scripts: scriptsFor("acme.test"), url, frame: true });
+  const hide = { type: "SET_CURSOR_VISIBLE", visible: false };
+
+  assert.equal(frame.sandbox.__autoApplyCursor.isEnabled(), true, "on by default");
+
+  deliver(top, hide);
+  const framed = deliver(frame, hide);
+
+  assert.equal(top.sandbox.__autoApplyCursor.isEnabled(), false);
+  assert.equal(frame.sandbox.__autoApplyCursor.isEnabled(), false,
+    "an embedded frame draws its own cursor and must hide it too");
+
+  // The panel still gets exactly one answer, from the page.
+  assert.equal(deliver(top, hide).replies.length, 1);
+  assert.equal(framed.replies.length, 0);
+});
