@@ -22,7 +22,8 @@ it has never seen, without anyone adding support for them first.
 | Results discovery on any board | done — by repeated structure, not per-site selectors |
 | Apply driver (dialog, form, external ATS, new tab) | done |
 | Side panel UI | done |
-| Tests | `npm test` — 249 passing |
+| Applications embedded in an ATS iframe | done — the worker drives the frame |
+| Tests | `npm test` — 265 passing |
 
 ## How a run goes
 

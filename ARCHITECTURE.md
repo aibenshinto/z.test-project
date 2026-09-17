@@ -579,5 +579,38 @@ heading.
 2. A form is the application only if it takes a file or its own wording says
    so. A careers page's contact form otherwise reads as one, and the agent
    sends the company a message instead of applying.
-3. `all_frames` is still false, so an application inside an embedded ATS
-   iframe is invisible to the agent. This is the largest remaining gap.
+3. Every frame of a page runs these scripts, so every frame sees every
+   message sent to the tab and the first reply wins. A message for one frame
+   is addressed to it and marked `toFrame`; everything else is the page's. An
+   embedded ad must never be able to answer "take over this page".
+
+### Applications embedded in a frame (2026-09-17)
+
+A company careers page usually does not host its own application: it embeds
+Greenhouse, Lever, Workday or Ashby in an iframe. With `all_frames: false` the
+agent read only the top document, found no way to apply, and skipped the job
+while the form sat in a frame it could not see.
+
+```
+careers.acme.test  ── the page the agent reads ── no apply control
+   └─ iframe → boards.greenhouse.io/embed/job_app  ── the actual application
+```
+
+The scripts now run in every frame, and the worker — the only part that can
+address a frame — brokers the hand-off:
+
+1. the page tries to open an application and finds nothing
+2. it asks the worker (`APPLY_IN_FRAME`)
+3. the worker runs `reportFrameState` in every frame of the tab and picks one
+   (`src/lib/frames.js`): an http(s) frame, never frame 0, that says it is
+   showing or offering an application — an open form beating a merely offered
+   one, and between two of a kind the one with more of a form in it
+4. the worker drives that frame with `TAKEOVER_APPLY_HERE` + `toFrame`, and
+   returns its outcome to the page
+
+Only the page asks. A frame that finds no application is the end of the line,
+or a page and its frames would hand the job back and forth.
+
+The routing rule this needs is in the behavioural facts above, and is the part
+to be careful with: before it, an embedded ad could have answered the side
+panel's "take over this page" ahead of the page itself.

@@ -715,3 +715,90 @@ test("on a board that shows the job in a pane, opening waits for that job", asyn
   assert.equal(e.sandbox.__autoApplyTakeover.jobIsOpen(second), true);
   assert.equal(e.sandbox.__autoApplyTakeover.jobIsOpen(first), false);
 });
+
+// ---------------------------------------------------------------------------
+// Applications embedded in a frame
+// ---------------------------------------------------------------------------
+
+/** Deliver a message to every listener the scripts registered. */
+function deliver(e, msg) {
+  const replies = [];
+  let keptChannel = false;
+  for (const listener of e.sandbox.__messageListeners) {
+    if (listener(msg, {}, (reply) => replies.push(reply))) keptChannel = true;
+  }
+  return { replies, keptChannel };
+}
+
+test("a message to the page is answered by the page, not by a frame inside it", () => {
+  // Every frame of a tab runs these scripts and sees every message sent to
+  // that tab, and the first reply wins. An embedded ad answering "take over
+  // this page" would take the run with it.
+  const url = "https://acme.test/careers/1";
+  const top = createEnvironment({ scripts: scriptsFor("acme.test"), url });
+  const frame = createEnvironment({ scripts: scriptsFor("acme.test"), url, frame: true });
+
+  assert.equal(deliver(top, { type: "TAKEOVER_STATUS" }).replies.length, 1);
+  assert.equal(deliver(frame, { type: "TAKEOVER_STATUS" }).replies.length, 0,
+    "a frame must leave the page's messages to the page");
+});
+
+test("a message addressed to a frame is answered by that frame, not by the page", () => {
+  const url = "https://acme.test/careers/1";
+  const top = createEnvironment({ scripts: scriptsFor("acme.test"), url });
+  const frame = createEnvironment({ scripts: scriptsFor("acme.test"), url, frame: true });
+  const addressed = { type: "TAKEOVER_APPLY_HERE", toFrame: true, job: { title: "Python Developer" } };
+
+  assert.equal(deliver(top, addressed).keptChannel, false,
+    "the page must not answer for one of its frames");
+  assert.equal(deliver(frame, addressed).keptChannel, true);
+});
+
+test("a page with no way to apply asks whether one of its frames has the application", async () => {
+  // A company careers page usually embeds its ATS rather than hosting the
+  // form, so the page itself offers nothing the agent can see.
+  const e = createEnvironment({ scripts: scriptsFor("acme.test"), url: "https://acme.test/careers/1" });
+  e.sandbox.__autoApplyTakeover.configure({ settleMax: 100, openWaitMs: 200, applyBudgetMs: 600 });
+  e.make("h1", { text: "Senior Python Developer", rect: { width: 400, height: 40 } });
+
+  const asked = [];
+  e.sandbox.chrome.runtime.sendMessage = async (msg) => {
+    asked.push(msg.type);
+    return msg.type === "APPLY_IN_FRAME"
+      ? { ok: true, found: true, result: { submitted: true, reason: "embedded form submitted" } }
+      : { ok: true };
+  };
+
+  const result = await e.sandbox.__autoApplyTakeover.applyToOpenJob({ title: "Senior Python Developer" });
+
+  assert.ok(asked.includes("APPLY_IN_FRAME"), "the page must ask about its frames before giving up");
+  assert.equal(result.submitted, true);
+});
+
+test("a frame that finds no application does not ask about frames of its own", async () => {
+  // Otherwise a page and its frames hand the job back and forth.
+  const e = createEnvironment({
+    scripts: scriptsFor("acme.test"), url: "https://acme.test/careers/1", frame: true,
+  });
+  e.sandbox.__autoApplyTakeover.configure({ settleMax: 100, openWaitMs: 200, applyBudgetMs: 600 });
+
+  const asked = [];
+  e.sandbox.chrome.runtime.sendMessage = async (msg) => { asked.push(msg.type); return { ok: true }; };
+
+  const result = await e.sandbox.__autoApplyTakeover.applyToOpenJob({ title: "Senior Python Developer" });
+
+  assert.equal(asked.includes("APPLY_IN_FRAME"), false);
+  assert.equal(result.submitted, false);
+});
+
+test("a page whose frames hold no application reports that, rather than the frame check", async () => {
+  const e = createEnvironment({ scripts: scriptsFor("acme.test"), url: "https://acme.test/careers/1" });
+  e.sandbox.__autoApplyTakeover.configure({ settleMax: 100, openWaitMs: 200, applyBudgetMs: 600 });
+  e.sandbox.chrome.runtime.sendMessage = async (msg) =>
+    msg.type === "APPLY_IN_FRAME" ? { ok: true, found: false } : { ok: true };
+
+  const result = await e.sandbox.__autoApplyTakeover.applyToOpenJob({ title: "Senior Python Developer" });
+
+  assert.equal(result.submitted, false);
+  assert.match(result.reason, /no control that starts an application/i);
+});

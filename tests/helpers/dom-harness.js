@@ -396,13 +396,19 @@ export function createEnvironment(opts = {}) {
     chrome: {
       runtime: {
         sendMessage: async () => ({ ok: true }),
-        onMessage: { addListener: () => {} },
+        onMessage: { addListener: (fn) => sandbox.__messageListeners.push(fn) },
       },
     },
   };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
   sandbox.self = sandbox;
+  // Every frame of a page runs these scripts. A document is the page itself
+  // unless the test asks for an embedded one, which sees a different `top`.
+  sandbox.top = opts.frame ? { embedded: true } : sandbox;
+  sandbox.parent = sandbox.top;
+  /** Listeners registered through chrome.runtime.onMessage, for tests to drive. */
+  sandbox.__messageListeners = [];
 
   for (const file of opts.scripts || []) loadScript(sandbox, file);
 

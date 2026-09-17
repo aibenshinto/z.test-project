@@ -25,6 +25,7 @@ import { evaluateJobWithModel } from "../lib/evaluator.js";
 import { askJSON } from "../lib/llm/index.js";
 import { info, warn, getLog } from "../lib/logger.js";
 import { isApplicationReceiptUrl } from "../lib/boards.js";
+import { pickApplicationFrame } from "../lib/frames.js";
 import { profileHintForQuestion } from "../lib/questions.js";
 import { decideAction } from "../lib/ui-agent.js";
 import {
@@ -227,6 +228,51 @@ async function followReceipt(tabId, job, since) {
     await chrome.tabs.remove(application.id).catch(() => {});
   }
   return result;
+}
+
+// ---- Applications inside an embedded frame ---------------------------------
+//
+// A company careers page usually embeds its ATS — Greenhouse, Lever, Workday —
+// rather than hosting the form itself. The page then offers no way to apply
+// that its own scripts can see, because the form is in another document.
+// A content script cannot reach into a frame, but the worker can address one.
+
+/**
+ * Run in every frame of a tab to ask what that frame is showing.
+ *
+ * This is serialised and injected, so it must not close over anything here.
+ * It runs in the same isolated world as the content scripts, which is why it
+ * can ask the adapter that is already there.
+ */
+function reportFrameState() {
+  const snapshot = globalThis.genericObserver?.observe?.() || null;
+  return {
+    url: location.href,
+    state: snapshot?.page?.applicationState || "unknown",
+    fields: document.querySelectorAll("input, textarea, select").length,
+  };
+}
+
+/** Ask every frame in `tabId` what it is showing, and pick the application. */
+async function applicationFrame(tabId) {
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: reportFrameState,
+    });
+  } catch (err) {
+    await info("Could not read this page's frames", { reason: String(err?.message || err) });
+    return null;
+  }
+
+  // A frame that could not be injected — a blank one, or one whose document
+  // went away mid-call — simply does not answer.
+  const probes = (injected || [])
+    .filter((entry) => entry && entry.result)
+    .map((entry) => ({ frameId: entry.frameId, ...entry.result }));
+
+  return pickApplicationFrame(probes);
 }
 
 /** Shape a results card, read as plain text, for the evaluator. */
@@ -466,6 +512,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
         await info("Takeover job evaluated", { title: job.title, decision: ev.decision, match_score: ev.match_score });
         return sendResponse({ ok: true, decision: ev.decision, match_score: ev.match_score, reason: fitReason(ev) });
+      }
+
+      case "APPLY_IN_FRAME": {
+        // The page found no way to apply. Its application may be embedded in
+        // a frame, which only the worker can address.
+        const tabId = sender?.tab?.id;
+        if (!tabId) return sendResponse({ ok: false, error: "no originating tab" });
+
+        const frame = await applicationFrame(tabId);
+        if (!frame) return sendResponse({ ok: true, found: false });
+
+        await info("The application is in an embedded frame; continuing there", { url: frame.url });
+        try {
+          const result = await chrome.tabs.sendMessage(
+            tabId,
+            { type: "TAKEOVER_APPLY_HERE", job: msg.job || null, toFrame: true },
+            { frameId: frame.frameId },
+          );
+          return sendResponse({ ok: true, found: true, result });
+        } catch (err) {
+          // The frame navigated or was removed while it was being driven.
+          return sendResponse({ ok: true, found: true, result: {
+            submitted: false,
+            reason: `the embedded application stopped responding (${String(err?.message || err)})`,
+          } });
+        }
       }
 
       case "CLOSE_OPENED_TAB": {

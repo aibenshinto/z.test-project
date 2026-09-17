@@ -156,6 +156,11 @@
       });
 
       if (!opened.opened) {
+        // A page that offers no way to apply may not be hosting its own
+        // application at all: a careers page usually embeds its ATS, and that
+        // form is in a document this one cannot see.
+        const embedded = await applyInEmbeddedFrame(job);
+        if (embedded) return embedded;
         return { submitted: false, reason: opened.reason, tried: opened.tried };
       }
 
@@ -171,6 +176,30 @@
     // An apply control part-way through the form moved it to a new tab.
     if (outcome.newTab) return followOpenedApplication(outcome.newTab, job);
     return outcome;
+  }
+
+  /**
+   * Hand the application to an embedded frame, if one of this page's frames
+   * is holding it.
+   *
+   * Only the page asks: a frame that finds no application is at the end of
+   * the line, and letting it ask again would have frames handing the job back
+   * and forth. Returns null when no frame has an application, which is the
+   * usual case and means "this page really does not offer one".
+   */
+  async function applyInEmbeddedFrame(job) {
+    if (!isTopFrame) return null;
+    try {
+      const res = await chrome.runtime.sendMessage({
+        type: "APPLY_IN_FRAME", job: job ? stripJob(job) : null,
+      });
+      if (!res?.ok || !res.found) return null;
+      report({ phase: "form", job: job?.title, note: "Filling the embedded application" });
+      return res.result ||
+        { submitted: false, reason: "the embedded application did not report a result" };
+    } catch (_) {
+      return null;
+    }
   }
 
   async function followOpenedApplication(tab, job) {
@@ -539,7 +568,22 @@
   // Messages from the side panel
   // -------------------------------------------------------------------------
 
+  /**
+   * Is this document the page itself, rather than a frame embedded in it?
+   *
+   * Every frame in a tab runs these scripts, so every frame sees every message
+   * sent to that tab and the first reply wins. A message meant for one
+   * particular frame is sent to that frame and marked `toFrame`; everything
+   * else belongs to the page. Without this, an embedded ad could answer
+   * "take over this page" before the page did.
+   */
+  const isTopFrame = (() => {
+    try { return window.top === window.self; } catch (_) { return false; }
+  })();
+
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (Boolean(msg.toFrame) === isTopFrame) return false;
+
     switch (msg.type) {
       case "TAKEOVER_START":
         run(msg.options || {})
