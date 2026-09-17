@@ -21,6 +21,17 @@ import {
 const TICK = "autoapply-tick";
 const SESSION = "agentSession";
 
+async function persistApplyTrace(entry) {
+  const { applyTrace = [] } = await chrome.storage.local.get("applyTrace");
+  applyTrace.push({
+    at: Date.now(),
+    ...entry
+  });
+  await chrome.storage.local.set({
+    applyTrace: applyTrace.slice(-100)
+  });
+}
+
 /**
  * Accept only http(s) URLs for agent-requested navigation.
  * A `javascript:` or `data:` URL would be code execution by another name.
@@ -230,14 +241,19 @@ function duplicateOf(queue, job) {
   );
 }
 
+let tickRunning = false;
+
 // One unit of work per tick: take the highest-ranked queued job and try it.
 async function tick() {
-  const session = await loadSession();
-  if (session.paused || session.state === STATES.STOPPED) return;
-  if (session.state === STATES.WAITING_FOR_USER || session.state === STATES.BLOCKED) {
-    await info("Holding for user", { state: session.state });
-    return;
-  }
+  if (tickRunning) return;
+  tickRunning = true;
+  try {
+    const session = await loadSession();
+    if (session.paused || session.state === STATES.STOPPED) return;
+    if (session.state === STATES.WAITING_FOR_USER || session.state === STATES.BLOCKED) {
+      await info("Holding for user", { state: session.state });
+      return;
+    }
 
   const gate = await canSubmit();
   if (!gate.ok) {
@@ -271,6 +287,11 @@ async function tick() {
     minRelevance: settings.governor.minRelevance,
     preferences: settings.preferences,
   });
+
+  // Check if the user paused or stopped the run while the model was evaluating.
+  const postEvalSession = await loadSession();
+  if (postEvalSession.paused || postEvalSession.state === STATES.STOPPED) return;
+
   next.evaluation = ev;
   next.relevance = ev.relevance;
   next.match_score = ev.match_score;
@@ -310,6 +331,10 @@ async function tick() {
     await saveSession(s);
 
     const result = await applyToJob(next, s);
+    const traceEntryReceived = { stage: "worker_received", jobId: next.id, title: next.title, company: next.company, url: next.url, result, submitted: result?.submitted };
+    console.log("[APPLY_TRACE]", JSON.stringify(traceEntryReceived));
+    await persistApplyTrace(traceEntryReceived);
+    
     next.status = result.submitted ? "submitted"
       : result.waitingForUser ? "waiting_for_user"
       : result.blocked ? "blocked"
@@ -317,7 +342,19 @@ async function tick() {
       : "needs_review";
     next.result = result;
 
-    if (result.submitted) await recordSubmit({ site: next.site, jobId: next.id });
+    if (result.submitted) {
+      const traceEntryRecordSubmit = { stage: "tick_recordSubmit_called", site: next.site, jobId: next.id, title: next.title, company: next.company, url: next.url };
+      console.log("[APPLY_TRACE]", JSON.stringify(traceEntryRecordSubmit));
+      await persistApplyTrace(traceEntryRecordSubmit);
+      await recordSubmit(next);
+      const traceStats = { stage: "stats_after_submit", stats: await stats() };
+      console.log("[APPLY_TRACE]", JSON.stringify(traceStats));
+      await persistApplyTrace(traceStats);
+    } else {
+      const traceEntryNotCalled = { stage: "tick_result_false", site: next.site, jobId: next.id, title: next.title, company: next.company, url: next.url, reason: result?.reason };
+      console.log("[APPLY_TRACE]", JSON.stringify(traceEntryNotCalled));
+      await persistApplyTrace(traceEntryNotCalled);
+    }
     if (!result.submitted) {
       await warn("Application requires attention", {
         jobId: next.id,
@@ -383,6 +420,9 @@ async function tick() {
   await chrome.alarms.create(TICK, {
     when: Date.now() + randomDelay(settings.governor),
   });
+  } finally {
+    tickRunning = false;
+  }
 }
 
 async function applyToJob(job, session) {
@@ -413,7 +453,13 @@ async function applyToJob(job, session) {
       progress: { step: 2, total: 5, action: "answering questions" },
       updatedAt: Date.now(),
     });
+    const traceSend = { stage: "applyToJob_sending", site: job.site, jobId: job.id, title: job.title, company: job.company, url: job.url };
+    console.log("[APPLY_TRACE]", JSON.stringify(traceSend));
+    await persistApplyTrace(traceSend);
     let result = adapterResult(await chrome.tabs.sendMessage(tabId, { type: platform.applyMessage, job }));
+    const traceReceived = { stage: "applyToJob_received", result };
+    console.log("[APPLY_TRACE]", JSON.stringify(traceReceived));
+    await persistApplyTrace(traceReceived);
 
     if (result && result.waitingForUser) {
       await saveSession({
@@ -565,8 +611,11 @@ async function userAnswerAndContinue(answer) {
     return { ok: true, waiting: true };
   }
   if (result && result.submitted) {
+    const traceUac = { stage: "userAnswerAndContinue_recordSubmit_called", site: job.site, jobId: job.id, title: job.title, company: job.company, url: job.url };
+    console.log("[APPLY_TRACE]", JSON.stringify(traceUac));
+    await persistApplyTrace(traceUac);
     job.status = "submitted";
-    await recordSubmit({ site: job.site, jobId: job.id });
+    await recordSubmit(job);
     await chrome.tabs.remove(tabId).catch(() => {});
     await set("queue", queue);
     await saveSession({ ...emptySession(), state: STATES.COMPLETED, updatedAt: Date.now() });
@@ -794,7 +843,16 @@ async function enableExternalSiteAndContinue() {
     : result?.waitingForUser ? "waiting_for_user"
     : result?.blocked ? "blocked"
     : "needs_review";
-  if (result?.submitted) await recordSubmit({ site: "generic", jobId: job.id });
+  if (result?.submitted) {
+    const traceExt = { stage: "enableExternalSiteAndContinue_recordSubmit_called", site: "generic", jobId: job.id, title: job.title, company: job.company, url: job.url };
+    console.log("[APPLY_TRACE]", JSON.stringify(traceExt));
+    await persistApplyTrace(traceExt);
+    await recordSubmit({ ...job, site: "generic" });
+  } else {
+    const traceExtFalse = { stage: "enableExternalSiteAndContinue_result_false", site: "generic", jobId: job.id, title: job.title, company: job.company, url: job.url, reason: result?.reason };
+    console.log("[APPLY_TRACE]", JSON.stringify(traceExtFalse));
+    await persistApplyTrace(traceExtFalse);
+  }
   await set("queue", queue);
   return { ok: true, result };
 }
@@ -823,6 +881,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "PAUSE":  await pauseRun();            return sendResponse({ ok: true });
       case "RESUME": await resumeRun();           return sendResponse({ ok: true });
       case "STATS":  return sendResponse(await stats());
+      case "RECORD_SUBMIT":
+        const traceRecSub = { stage: "RECORD_SUBMIT_handler", payload: msg.payload };
+        console.log("[APPLY_TRACE]", JSON.stringify(traceRecSub));
+        await persistApplyTrace(traceRecSub);
+        await recordSubmit(msg.payload);
+        const traceRecSubStats = { stage: "stats_after_submit", stats: await stats() };
+        console.log("[APPLY_TRACE]", JSON.stringify(traceRecSubStats));
+        await persistApplyTrace(traceRecSubStats);
+        return sendResponse({ ok: true });
       case "GET_SESSION":
         return sendResponse({
           ok: true,
