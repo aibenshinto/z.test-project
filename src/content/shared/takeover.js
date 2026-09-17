@@ -5,7 +5,7 @@
 // already signed in and run the search they want, and the agent takes over
 // that tab and works down the visible results while the user watches.
 //
-//   you search on Naukri/LinkedIn
+//   you search on any job board
 //        ↓  press Start
 //   walk the visible results
 //        ↓
@@ -67,24 +67,18 @@
   }
 
   // -------------------------------------------------------------------------
-  // Platform adapter selection
+  // Page adapter
   // -------------------------------------------------------------------------
 
   /**
-   * Pick the adapter for whatever page we are on right now.
+   * The adapter for whatever page we are on right now.
    *
-   * This is re-evaluated on every job, because a single run legitimately
-   * crosses sites: a Naukri result can redirect to a company's own ATS, and
-   * from that point the generic adapter is the correct one.
+   * There is one, and it reads any page: an application is found by what the
+   * page offers, not by which site it is. A run crosses sites constantly — a
+   * board's result opens the company's own ATS, which opens a third-party
+   * form — and none of those hops need the agent to know the site.
    */
   function adapterForCurrentPage() {
-    const host = location.hostname;
-    if (/(^|\.)naukri\.com$/i.test(host) && globalThis.naukriAgentLoop) {
-      return globalThis.naukriAgentLoop.adapter;
-    }
-    if (/(^|\.)linkedin\.com$/i.test(host) && globalThis.linkedinAgentLoop) {
-      return globalThis.linkedinAgentLoop.adapter;
-    }
     return globalThis.genericAgentLoop?.adapter || null;
   }
 
@@ -100,9 +94,8 @@
   /**
    * Drive one job to a conclusion: open the application, fill it, verify.
    *
-   * Runs wherever the job took us — the same Naukri page, an Easy Apply
-   * dialog, or a company ATS in a new tab — by re-selecting the adapter for
-   * the page the agent is actually on.
+   * Runs wherever the job took us — the board's own page, an apply dialog,
+   * or a company ATS in a new tab — by reading whatever page it is on.
    */
   async function applyToOpenJob(job) {
     const adapter = adapterForCurrentPage();
@@ -132,16 +125,17 @@
         snapshot.page.applicationState === "unknown") {
       report({ phase: "apply", job: job?.title, note: "Looking for the apply button" });
 
-      // A company careers page often lists every opening with its own Apply.
-      // Only this job's Apply will do; the first one on the page is usually
-      // a different job.
-      const listed = adapter.name === "generic" ? applyControlForJob(job) : null;
+      // A page often lists every opening with its own Apply — a company
+      // careers page, or a board that shows the job in a pane beside the
+      // results. Only this job's Apply will do; the first one on the page is
+      // usually a different job.
+      const listed = applyControlForJob(job);
       if (listed && !listed.element) {
         return { submitted: false, reason: `this page lists several jobs, but not "${job.title}"` };
       }
 
       const opened = await loop().openApplication({
-        hint: listed ? () => listed.element : platformApplyHint(),
+        hint: listed ? () => listed.element : undefined,
         snapshot: listed ? { ...snapshot, applyCandidates: [] } : snapshot,
         opened: () => applicationStarted(adapter),
         settleMax: TIMING.settleMax,
@@ -177,19 +171,6 @@
     const state = adapter.observe().page.applicationState;
     return state === "applying" || state === "chatbot" ||
            state === "questionnaire" || state === "done";
-  }
-
-  /** The platform's own apply-button locator, when it has one. */
-  function platformApplyHint() {
-    const host = location.hostname;
-    if (/(^|\.)linkedin\.com$/i.test(host) && globalThis.LINKEDIN_SEL) {
-      return () => globalThis.LINKEDIN_SEL.job.easyApply();
-    }
-    if (/(^|\.)naukri\.com$/i.test(host) && globalThis.NAUKRI_SEL) {
-      return () => [...document.querySelectorAll(globalThis.NAUKRI_SEL.job.applyButton)]
-        .find((el) => obs().isVisible(el)) || null;
-    }
-    return undefined;
   }
 
   // -------------------------------------------------------------------------
@@ -254,7 +235,7 @@
   /**
    * Get back to the results list after finishing a job.
    *
-   * On LinkedIn the list never went away (the detail renders in a pane), so
+   * On a board that renders the detail in a pane the list never went away, so
    * this is usually a no-op. Where the job replaced the page, history.back()
    * returns to the search the user ran — which is why the agent navigates by
    * going back rather than by re-running the search itself.
@@ -341,6 +322,12 @@
           const fit = await checkFit(job);
           if (fit.error) {
             return { ...summarize(applied, skipped, fit.error), ok: false, error: fit.error };
+          }
+          // The rate governor has had enough for now — a daily or hourly cap,
+          // or the breaker tripped. That ends the run rather than skipping a
+          // job: the next job would be refused for the same reason.
+          if (fit.decision === "STOP") {
+            return summarize(applied, skipped, `stopped: ${fit.reason}`);
           }
           if (fit.decision !== "APPLY") {
             skipped.push({ ...stripJob(job), reason: fit.reason });

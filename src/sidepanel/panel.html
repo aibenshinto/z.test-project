@@ -62,7 +62,6 @@
 <nav>
   <button data-tab="setup" aria-selected="true">Setup</button>
   <button data-tab="profile" aria-selected="false">Profile</button>
-  <button data-tab="jobs" aria-selected="false">Jobs</button>
   <button data-tab="answers" aria-selected="false">Answers</button>
   <button data-tab="run" aria-selected="false">Run</button>
 </nav>
@@ -87,7 +86,7 @@
 
   <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
   <div style="font-size:12px;font-weight:600;margin-bottom:2px">UI Agent <span class="pill">form navigator</span></div>
-  <div class="meta" style="margin-bottom:6px">Model that watches the page and decides every click, type, and submit on Naukri &amp; LinkedIn.</div>
+  <div class="meta" style="margin-bottom:6px">Model that watches the page and decides every click, type, and submit, on any job board.</div>
 
   <label>UI Agent provider</label>
   <select id="uiProvider">
@@ -133,7 +132,7 @@
   <div id="profileGuidance" class="status" hidden></div>
   <label>Full name</label><input id="pName">
   <label>Current title</label><input id="pTitle">
-  <label>Headline (50+ characters — Naukri rejects shorter)</label>
+  <label>Headline</label>
   <textarea id="pHeadline" rows="2"></textarea>
   <div class="meta" id="pHeadlineLen"></div>
   <div class="grid2">
@@ -171,14 +170,72 @@
   <button class="act ghost" id="savePreferences">Save preferences</button>
 </section>
 
-<section id="tab-jobs" hidden>
-  <label>Search URL (Naukri or LinkedIn results page)</label>
-  <input id="searchUrl" placeholder="https://www.naukri.com/python-jobs-in-bangalore">
-  <div class="row">
-    <button class="act" id="scrape">Scrape into queue</button>
-    <button class="act ghost" id="clearQueue">Clear queue</button>
+<section id="tab-answers" hidden>
+  <div class="meta">Cached screening answers. Correct one here and every future application uses it.</div>
+  <div id="bankOut" style="margin-top:8px"></div>
+</section>
+
+<section id="tab-run" hidden>
+  <h3>Agent takeover</h3>
+  <p class="meta">
+    Sign in and search for jobs yourself, then press Take over. The agent works
+    down the results in this tab while you watch — you can stop it at any time.
+  </p>
+  <div id="takeoverContext" class="meta"></div>
+  <div class="row" style="margin-top:6px;flex-wrap:wrap;gap:6px">
+    <button class="act" id="takeoverStart">Take over this page</button>
+    <button class="act ghost" id="takeoverPause" hidden>Pause</button>
+    <button class="act ghost" id="takeoverResume" hidden>Resume</button>
+    <button class="act danger" id="takeoverStop" hidden>Stop</button>
   </div>
-  <div id="queueOut" style="margin-top:10px"></div>
+  <div class="row" style="margin-top:6px">
+    <div><label>Max jobs</label><input id="maxJobs" type="number" value="25" min="1" max="100"></div>
+    <div><label>Max pages</label><input id="maxPages" type="number" value="3" min="1" max="20"></div>
+  </div>
+  <label style="display:flex;align-items:center;gap:6px;margin-top:6px">
+    <input id="showCursor" type="checkbox" checked style="width:auto">
+    Show the agent cursor on the page
+  </label>
+  <div id="takeoverStatus" class="meta" style="margin-top:8px"></div>
+
+  <h3 style="margin-top:18px">Limits</h3>
+  <p class="meta">
+    Every application the agent makes passes these. They are what keeps a run
+    looking like a person rather than a script.
+  </p>
+  <div class="grid2">
+    <div><label>Current location</label><input id="pLocation"></div>
+    <div><label>Total years</label><input id="pYears" type="number" step="0.5"></div>
+  </div>
+  <label>Preferred locations (comma separated)</label><input id="pPreferred">
+  <label>Skills — one per line, <code>name: years</code></label>
+  <textarea id="pSkills" rows="6" placeholder="Python: 2&#10;Django: 2"></textarea>
+  <div class="grid2">
+    <div><label>Email</label><input id="pEmail" type="email"></div>
+    <div><label>Phone</label><input id="pPhone" type="tel"></div>
+    <div><label>Notice period (days)</label><input id="pNotice" type="number" min="0"></div>
+    <div><label>Remote preference</label><select id="pRemote"><option value="">Not specified</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="onsite">On-site</option></select></div>
+  </div>
+  <label>Work authorization</label><input id="pWorkAuth" placeholder="Only enter an explicit answer">
+  <label>Visa sponsorship requirement</label><input id="pVisa" placeholder="Only enter an explicit answer">
+  <label>Current salary</label><input id="pCurrentSalary">
+  <label>Salary expectation</label><input id="pSalaryExpectation">
+  <label><input id="pRelocate" type="checkbox" style="width:auto"> Willing to relocate</label>
+  <div class="row"><button class="act" id="saveProfile">Save profile</button><button class="act ghost" id="loadSeed">Load seed</button></div>
+  <div id="profileCheck" class="meta" style="margin-top:8px"></div>
+  <h2 style="font-size:13px;margin:18px 0 0">Job preferences</h2>
+  <label>Target titles (comma separated)</label><input id="prefTitles" placeholder="Python Developer, Backend Developer">
+  <label>Locations (comma separated)</label><input id="prefLocations" placeholder="Bangalore, Remote">
+  <label><input id="prefAnywhereIndia" type="checkbox" style="width:auto"> Apply anywhere in India</label>
+  <div class="grid2">
+    <div><label>Minimum experience</label><input id="prefExpMin" type="number" min="0" step="0.5"></div>
+    <div><label>Maximum experience</label><input id="prefExpMax" type="number" min="0" step="0.5"></div>
+  </div>
+  <label>Employment types (comma separated)</label><input id="prefEmployment" placeholder="Full-time">
+  <label>Companies to exclude (comma separated)</label><input id="prefExcludeCompanies">
+  <label>Required keywords (comma separated)</label><input id="prefIncludeKeywords">
+  <label>Excluded keywords (comma separated)</label><input id="prefExcludeKeywords">
+  <button class="act ghost" id="savePreferences">Save preferences</button>
 </section>
 
 <section id="tab-answers" hidden>
@@ -235,13 +292,7 @@
   <input id="minRelevance" type="number" step="0.05" min="0" max="1">
   <button class="act ghost" id="saveGov">Save limits</button>
 
-  <div class="row" style="margin-top:14px">
-    <button class="act" id="start">Start auto-apply</button>
-    <button class="act ghost" id="pause">Pause</button>
-    <button class="act ghost" id="resume">Resume</button>
-    <button class="act danger" id="stop">Stop</button>
-  </div>
-  <button class="act ghost" id="clearHalt">Clear halt</button>
+  <button class="act ghost" id="clearHalt" style="margin-top:10px">Clear halt</button>
   <div id="log" class="meta" style="margin-top:10px"></div>
 
   <h3 style="margin-top:16px">Interaction diagnostics</h3>

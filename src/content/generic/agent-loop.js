@@ -1,12 +1,12 @@
-// Generic (external ATS) agent loop — thin adapter over the shared core.
+// The agent loop's adapter — thin wrapper over the shared core.
 //
 // The observe → decide → execute → wait → verify → reassess cycle lives in
 // src/content/shared/agent-loop-core.js. This file supplies the platform
-// adapter for an arbitrary company career site and owns the message listener.
+// adapter for any page the agent lands on: a job board, a company careers
+// page, or a third-party ATS.
 //
 // Lifecycle:
-//   GENERIC_APPLY    → start a fresh agent loop
-//   GENERIC_CONTINUE → re-observe and continue after the user filled a field
+//   the takeover drives this loop directly; it answers no messages of its own
 //
 // `submitted: true` requires an explicit submission confirmation on the page.
 // The model saying "finish" is never sufficient.
@@ -62,18 +62,6 @@
 
     return loop().run(adapter, { maxTurns: opts.maxTurns ?? 40 });
   }
-
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg.type !== "GENERIC_APPLY" && msg.type !== "GENERIC_CONTINUE") return;
-
-    // GENERIC_CONTINUE simply re-runs from the live DOM: the loop observes
-    // fresh and picks up wherever the user left off.
-    runAgentLoop()
-      .then((result) => sendResponse({ ok: true, ...result }))
-      .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
-
-    return true; // keep the message channel open
-  });
 
   globalThis.genericAgentLoop = { runAgentLoop, adapter };
 }());

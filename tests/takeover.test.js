@@ -127,17 +127,18 @@ test("a results page is distinguished from a single job page", () => {
 // Adapter selection follows the page, not the run
 // ---------------------------------------------------------------------------
 
-test("the adapter is chosen from the page the agent is on right now", () => {
-  for (const [hostname, expected] of [
-    ["www.naukri.com", "naukri"],
-    ["www.linkedin.com", "linkedin"],
-    ["boards.greenhouse.io", "generic"],
-    ["careers.acme.test", "generic"],
+test("one adapter reads every site, job board or company careers page", () => {
+  // A run crosses sites constantly — a board's result opens the company's own
+  // ATS, which opens a third-party form — and no hop needs the agent to know
+  // which site it is on.
+  for (const hostname of [
+    "www.naukri.com", "www.linkedin.com", "in.indeed.com",
+    "boards.greenhouse.io", "jobs.lever.co", "careers.acme.test",
   ]) {
     const e = createEnvironment({ scripts: scriptsFor(hostname), url: `https://${hostname}/x` });
     assert.equal(
-      e.sandbox.__autoApplyTakeover.adapterForCurrentPage().name, expected,
-      `${hostname} should use the ${expected} adapter`,
+      e.sandbox.__autoApplyTakeover.adapterForCurrentPage().name, "generic",
+      `${hostname} must be readable without a bundle of its own`,
     );
   }
 });
@@ -193,23 +194,6 @@ test("a job that opens in a new tab is clicked once, not clicked again as unresp
   assert.equal(clicks, 1, "a retry would open the job a second time");
   assert.equal(result.opened, true);
   assert.equal(result.newTab.id, 42);
-});
-
-test("the Naukri and LinkedIn bridges leave takeover messages to the takeover listener", () => {
-  // Every listener in a tab sees every message and the first reply wins, so
-  // an "unknown message" reply here pre-empted the real TAKEOVER_* replies.
-  for (const file of ["src/content/naukri/main.js", "src/content/linkedin/main.js"]) {
-    let listener = null;
-    const chrome = { runtime: { onMessage: { addListener: (fn) => { listener = fn; } } } };
-    new Function("chrome", readFileSync(fileURLToPath(new URL(`../${file}`, import.meta.url)), "utf8"))(chrome);
-
-    for (const type of ["TAKEOVER_START", "TAKEOVER_APPLY_HERE", "TAKEOVER_PROBE"]) {
-      let replied = false;
-      const keepsChannel = listener({ type }, {}, () => { replied = true; });
-      assert.equal(keepsChannel, false, `${file} must not claim ${type}`);
-      assert.equal(replied, false, `${file} must not answer ${type}`);
-    }
-  }
 });
 
 // ---------------------------------------------------------------------------

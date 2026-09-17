@@ -353,7 +353,7 @@
 
   /**
    * Type into a field. contenteditable is handled separately because setting
-   * `.value` on one is a silent no-op (a known Naukri behaviour).
+   * `.value` on one is a silent no-op.
    */
   async function type(id, value, opts = {}) {
     const resolved = resolveTarget(id);

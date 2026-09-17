@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AutoApply",
   "version": "0.3.0",
-  "description": "Watch an AI agent apply to jobs in your own browser tab, on Naukri, LinkedIn and company career sites.",
+  "description": "Watch an AI agent apply to jobs in your own browser tab, on any job board or company career site.",
   "permissions": [
     "storage",
     "alarms",
@@ -46,37 +46,6 @@
       ],
       "run_at": "document_idle",
       "all_frames": false
-    },
-    {
-      "matches": [
-        "https://*.naukri.com/*"
-      ],
-      "js": [
-        "src/content/naukri/selectors.js",
-        "src/content/naukri/typing.js",
-        "src/content/naukri/scrape.js",
-        "src/content/naukri/observer.js",
-        "src/content/naukri/executor.js",
-        "src/content/naukri/agent-loop.js",
-        "src/content/naukri/apply.js",
-        "src/content/naukri/main.js"
-      ],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": [
-        "https://*.linkedin.com/*"
-      ],
-      "js": [
-        "src/content/linkedin/selectors.js",
-        "src/content/linkedin/scrape.js",
-        "src/content/linkedin/observer.js",
-        "src/content/linkedin/executor.js",
-        "src/content/linkedin/agent-loop.js",
-        "src/content/linkedin/apply.js",
-        "src/content/linkedin/main.js"
-      ],
-      "run_at": "document_idle"
     }
   ]
 }

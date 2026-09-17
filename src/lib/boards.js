@@ -1,42 +1,10 @@
-// Platform registry. The worker looks up an adapter by job.site or tab URL.
-// Content scripts still own DOM; this module only routes intent.
-
-export const PLATFORMS = {
-  naukri: {
-    id: "naukri",
-    hostRe: /naukri\.com$/i,
-    scrapeMessage: "SCRAPE_PAGE",
-    applyMessage: "APPLY",
-    continueMessage: "CONTINUE_APPLY",
-  },
-  linkedin: {
-    id: "linkedin",
-    hostRe: /linkedin\.com$/i,
-    scrapeMessage: "SCRAPE_PAGE",
-    applyMessage: "APPLY",
-    continueMessage: "CONTINUE_APPLY",
-  },
-  generic: {
-    id: "generic",
-    hostRe: /.*/,
-    scrapeMessage: "SCRAPE_PAGE",
-    applyMessage: "APPLY",
-    continueMessage: "CONTINUE_APPLY",
-  },
-};
-
-export function platformFromUrl(url) {
-  let host = "";
-  try { host = new URL(url).hostname; } catch { return PLATFORMS.generic; }
-  if (/naukri\.com$/i.test(host) || host.endsWith(".naukri.com")) return PLATFORMS.naukri;
-  if (/linkedin\.com$/i.test(host) || host.endsWith(".linkedin.com")) return PLATFORMS.linkedin;
-  return PLATFORMS.generic;
-}
-
-export function platformFromJob(job) {
-  if (job?.site && PLATFORMS[job.site]) return PLATFORMS[job.site];
-  return platformFromUrl(job?.url || "");
-}
+// The few facts about specific job boards that the agent cannot work out by
+// looking at a page.
+//
+// This file is deliberately almost empty, and should stay that way: an
+// application is found by what a page offers, not by which site it is on.
+// Something belongs here only when a board does something invisible — a
+// redirect, a bookkeeping page — that no amount of reading the DOM reveals.
 
 /**
  * Is this the job board's own record of an apply click, rather than an

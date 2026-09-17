@@ -1,8 +1,7 @@
 // Shared agent loop (content-script side).
 //
 // One observe → decide → execute → wait → observe → verify → reassess cycle,
-// parameterised by a platform adapter. Naukri, LinkedIn and the generic ATS
-// driver all run this loop; they differ only in the hints they pass in.
+// parameterised by a page adapter. Every site runs this same loop.
 //
 // The loop that existed before this change executed an action and, on failure,
 // re-ran the identical action once. It had no notion of "the click worked but
@@ -48,7 +47,7 @@
   // -------------------------------------------------------------------------
 
   function securityGate(adapter) {
-    // Platform-specific check first (existing Naukri/LinkedIn logic).
+    // An adapter may add its own check on top of the shared signals.
     const platformAnomaly = adapter.checkAnomaly?.();
     if (platformAnomaly) {
       return { blocked: true, reason: platformAnomaly, kind: "platform" };

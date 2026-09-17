@@ -50,50 +50,52 @@ function matchesHost(pattern, hostname) {
 
 // Derived from the manifest rather than hardcoded, so a change to the load
 // order or a renamed file fails these tests instead of silently diverging.
-const LINKEDIN = manifestScripts("www.linkedin.com");
-const NAUKRI = manifestScripts("www.naukri.com");
+// Every site gets the same scripts now, so this is the whole content layer.
 const GENERIC = manifestScripts("boards.greenhouse.io");
 
 // ---------------------------------------------------------------------------
-// LinkedIn
+// Job boards, read by the one adapter
+//
+// There are no per-site bundles: the same adapter reads a LinkedIn dialog, a
+// Naukri apply button and an Indeed card, because it goes by what a page
+// offers rather than by which site it is. These are the behaviours the
+// per-site adapters used to guarantee, now asserted against the one path.
 // ---------------------------------------------------------------------------
 
-test("the LinkedIn adapter loads and exposes the API its callers use", () => {
-  const e = createEnvironment({ scripts: LINKEDIN, url: "https://www.linkedin.com/jobs/view/1" });
+/** A job page on `url`, with only the scripts every site gets. */
+const board = (url) => createEnvironment({ scripts: GENERIC, url });
 
-  assert.equal(typeof e.sandbox.linkedinObserver.observe, "function");
-  assert.equal(typeof e.sandbox.linkedinObserver.isComplete, "function");
-  assert.equal(typeof e.sandbox.linkedinExecutor.executeAction, "function");
-  assert.equal(typeof e.sandbox.linkedinAgentLoop.runAgentLoop, "function");
-  // getElement is retained for any caller that still resolves IDs directly.
-  assert.equal(typeof e.sandbox.linkedinObserver.getElement, "function");
-});
-
-test("LinkedIn reports state ready when an Easy Apply button is present", () => {
-  const e = createEnvironment({ scripts: LINKEDIN, url: "https://www.linkedin.com/jobs/view/1" });
+test("an Easy Apply button makes a job page ready to apply", () => {
+  const e = board("https://www.linkedin.com/jobs/view/1");
   e.make("button", { text: "Easy Apply", rect: { x: 500, y: 300, width: 120, height: 40 } });
 
-  const snapshot = e.sandbox.linkedinObserver.observe();
+  const snapshot = e.sandbox.genericObserver.observe();
   assert.equal(snapshot.page.applicationState, "ready");
-  assert.equal(snapshot.page.platform, "linkedin");
   assert.ok(snapshot.applyCandidates.length > 0);
 });
 
-test("LinkedIn finds an Easy Apply button that has only an aria-label", () => {
-  const e = createEnvironment({ scripts: LINKEDIN, url: "https://www.linkedin.com/jobs/view/1" });
-  e.make("button", { "aria-label": "Easy Apply", rect: { x: 500, y: 300, width: 120, height: 40 } });
+test("a board's own Apply button is ranked first on a job page", () => {
+  const e = board("https://www.naukri.com/job-listings-python-developer-acme-120925");
+  e.make("button", { id: "apply-button", text: "Apply", rect: { x: 400, y: 200, width: 100, height: 40 } });
 
-  assert.equal(e.sandbox.linkedinObserver.observe().page.applicationState, "ready");
+  assert.equal(e.sandbox.genericObserver.observe().applyCandidates[0].name, "Apply");
 });
 
-test("LinkedIn reports state applying once the dialog is open, and scopes the snapshot to it", () => {
-  const e = createEnvironment({ scripts: LINKEDIN, url: "https://www.linkedin.com/jobs/view/1" });
+test("an apply control found only by its aria-label still counts", () => {
+  const e = board("https://www.linkedin.com/jobs/view/1");
+  e.make("button", { "aria-label": "Easy Apply", rect: { x: 500, y: 300, width: 120, height: 40 } });
+
+  assert.equal(e.sandbox.genericObserver.observe().page.applicationState, "ready");
+});
+
+test("an open application dialog scopes the snapshot to itself", () => {
+  const e = board("https://www.linkedin.com/jobs/view/1");
   e.make("button", { text: "Some page control outside the dialog", rect: { width: 200, height: 40 } });
   const dialog = e.make("div", { role: "dialog", rect: { x: 100, y: 100, width: 600, height: 400 } });
   e.make("input", { type: "text", "aria-label": "Phone", rect: { width: 200, height: 30 } }, dialog);
   e.make("button", { text: "Next", rect: { width: 80, height: 36 } }, dialog);
 
-  const snapshot = e.sandbox.linkedinObserver.observe();
+  const snapshot = e.sandbox.genericObserver.observe();
   assert.equal(snapshot.page.applicationState, "applying");
 
   const labels = snapshot.elements.map((x) => x.text);
@@ -101,53 +103,102 @@ test("LinkedIn reports state applying once the dialog is open, and scopes the sn
   assert.ok(!labels.includes("Some page control outside the dialog"), "the snapshot must be scoped to the dialog");
 });
 
-test("LinkedIn treats an explicit confirmation as complete", () => {
-  const e = createEnvironment({ scripts: LINKEDIN, url: "https://www.linkedin.com/jobs/view/1" });
+test("an explicit confirmation is completion", () => {
+  const e = board("https://www.linkedin.com/jobs/view/1");
   e.make("div", { role: "alert", text: "Your application was sent to Acme", rect: { width: 400, height: 40 } });
 
-  assert.equal(e.sandbox.linkedinObserver.isComplete(), true);
-  assert.equal(e.sandbox.linkedinObserver.observe().page.applicationState, "done");
+  assert.equal(e.sandbox.genericObserver.isComplete(), true);
+  assert.equal(e.sandbox.genericObserver.observe().page.applicationState, "done");
 });
 
-test("LinkedIn does not treat a step advancing as completion", () => {
-  const e = createEnvironment({ scripts: LINKEDIN, url: "https://www.linkedin.com/jobs/view/1" });
+test("a plain confirmation banner counts, not only a board's own markers", () => {
+  // Some flows render a confirmation with no marker class at all. Missing it
+  // made the agent report a successful application as a skip.
+  const e = board("https://www.naukri.com/job-listings-python-developer-acme-120925");
+  e.make("h1", { text: "Application submitted", rect: { width: 400, height: 30 } });
+
+  assert.equal(e.sandbox.genericObserver.isComplete(), true);
+});
+
+test("an apply control that now reads Applied is proof the board recorded it", () => {
+  // What the per-site "already applied" check used to provide.
+  const e = board("https://www.naukri.com/job-listings-python-developer-acme-120925");
+  e.make("button", { id: "apply-button", text: "Applied", rect: { x: 400, y: 200, width: 100, height: 40 } });
+
+  assert.equal(e.sandbox.genericObserver.isComplete(), true);
+});
+
+test("an Applied badge on a results list is never read as this job being done", () => {
+  // The guard on the above. A list shows "Applied" on the jobs already done
+  // while still offering Apply on the rest; only a page with nothing left to
+  // apply to counts, or every unapplied job on the page reads as submitted.
+  const e = board("https://www.naukri.com/python-jobs");
+  e.make("button", { text: "Applied", rect: { x: 10, y: 10, width: 100, height: 36 } });
+  e.make("button", { text: "Apply", rect: { x: 10, y: 60, width: 100, height: 36 } });
+
+  assert.equal(e.sandbox.genericObserver.isComplete(), false);
+});
+
+test("a step advancing is not completion", () => {
+  const e = board("https://www.linkedin.com/jobs/view/1");
   const dialog = e.make("div", { role: "dialog", rect: { width: 600, height: 400 } });
   e.make("button", { text: "Review", rect: { width: 80, height: 36 } }, dialog);
   e.make("button", { text: "Submit application", rect: { width: 160, height: 36 } }, dialog);
 
-  assert.equal(e.sandbox.linkedinObserver.isComplete(), false);
+  assert.equal(e.sandbox.genericObserver.isComplete(), false);
 });
 
-test("LinkedIn reports blocked when a CAPTCHA frame is present", () => {
-  const e = createEnvironment({ scripts: LINKEDIN, url: "https://www.linkedin.com/jobs/view/1" });
+test("a results page is never mistaken for a completed application", () => {
+  // Whole-page text on a results page carries other jobs' statuses, which
+  // must not read as this application having been submitted.
+  const e = board("https://www.naukri.com/python-jobs");
+  e.make("div", { text: "Recommended jobs", rect: { width: 300, height: 24 } });
+  e.make("div", { text: "Application sent 2 days ago", rect: { width: 300, height: 24 } });
+
+  assert.equal(e.sandbox.genericObserver.isComplete(), false);
+});
+
+test("a CAPTCHA frame blocks the page", () => {
+  const e = board("https://www.linkedin.com/jobs/view/1");
   e.make("iframe", {
     src: "https://www.google.com/recaptcha/api2/bframe?k=x",
     rect: { x: 0, y: 0, width: 300, height: 400 },
   });
 
-  assert.equal(e.sandbox.linkedinObserver.observe().page.applicationState, "blocked");
+  assert.equal(e.sandbox.genericObserver.observe().page.applicationState, "blocked");
 });
 
-test("LinkedIn detects an external company application", () => {
-  const e = createEnvironment({ scripts: LINKEDIN, url: "https://www.linkedin.com/jobs/view/1" });
-  e.make("a", { text: "Apply on company website", href: "https://acme.test/jobs/1", rect: { width: 200, height: 40 } });
+test("a board that has signed the user out is a login wall, not an application", () => {
+  // What LinkedIn's checkpoint rule used to catch, by path rather than host.
+  const e = board("https://www.linkedin.com/checkpoint/challenge/1");
+  e.make("div", { class: "auth-wall", text: "Join now to see this job", rect: { width: 400, height: 200 } });
 
-  assert.equal(e.sandbox.linkedinObserver.observe().page.applicationState, "external");
+  assert.equal(e.sandbox.genericObserver.observe().page.applicationState, "login");
 });
 
-test("LinkedIn opens an Easy Apply button that ignores .click() but honours pointer events", async () => {
-  // The reported failure: the agent says it clicked Apply and LinkedIn does
-  // not progress. Loaded through the full manifest chain so apply.js and
-  // main.js are exercised too.
-  const e = createEnvironment({
-    scripts: LINKEDIN,
-    url: "https://www.linkedin.com/jobs/view/1",
-  });
+test("a questionnaire panel's controls are all visible to the model", () => {
+  const e = board("https://www.naukri.com/job-listings-python-developer-acme-120925");
+  const panel = e.make("div", { class: "singleselect-radiobutton", rect: { x: 0, y: 0, width: 600, height: 400 } });
+  e.make("button", { text: "Update my profile instead", rect: { width: 200, height: 36 } }, panel);
+  e.make("button", { text: "Save", rect: { width: 80, height: 36 } }, panel);
+
+  const labels = e.sandbox.genericObserver.observe().elements.map((x) => x.text);
+  // An older filter accepted only ^(save|send|next|submit|apply|continue|proceed|done|ok)$.
+  assert.ok(labels.includes("Save"));
+  assert.ok(labels.includes("Update my profile instead"));
+});
+
+test("an apply control that ignores .click() is opened with real pointer events", async () => {
+  // The reported failure: the agent says it clicked Apply and the board does
+  // not progress.
+  const e = board("https://www.linkedin.com/jobs/view/1");
+  e.sandbox.__autoApplyTakeover.configure({ settleMax: 200, openWaitMs: 400, applyBudgetMs: 1500 });
 
   const btn = e.make("button", { text: "Easy Apply", rect: { x: 500, y: 300, width: 120, height: 40 } });
   btn.click = () => { /* accepted by the DOM, ignored by the application */ };
   btn.addEventListener("pointerdown", () => {
     const dialog = e.make("div", { role: "dialog", rect: { x: 100, y: 100, width: 600, height: 400 } });
+    e.make("input", { type: "text", "aria-label": "Phone", rect: { width: 200, height: 30 } }, dialog);
     e.make("button", { text: "Submit application", rect: { width: 160, height: 36 } }, dialog);
   });
 
@@ -156,24 +207,22 @@ test("LinkedIn opens an Easy Apply button that ignores .click() but honours poin
       ? { ok: true, action: { action: "stop", reason: "end of test" } }
       : { ok: true };
 
-  const result = await e.sandbox.linkedinApply.apply({});
+  const result = await e.sandbox.__autoApplyTakeover.applyToOpenJob({ title: "Python Developer" });
 
-  assert.ok(e.sandbox.linkedinObserver.dialogRoot(), "the Easy Apply dialog must have opened");
+  assert.equal(e.sandbox.genericObserver.observe().page.applicationState, "applying",
+    "the application dialog must have opened");
   assert.equal(result.submitted, false, "opening the dialog is not submission");
 });
 
-test("LinkedIn reports a genuinely unresponsive Apply button instead of claiming success", async () => {
-  const e = createEnvironment({
-    scripts: LINKEDIN,
-    url: "https://www.linkedin.com/jobs/view/1",
-  });
+test("an unresponsive apply control is reported, not claimed as success", async () => {
+  const e = board("https://www.linkedin.com/jobs/view/1");
+  e.sandbox.__autoApplyTakeover.configure({ settleMax: 200, openWaitMs: 300, applyBudgetMs: 1200 });
   // A button nothing listens to at all.
   e.make("button", { text: "Easy Apply", rect: { x: 500, y: 300, width: 120, height: 40 } });
 
-  const result = await e.sandbox.linkedinApply.apply({});
+  const result = await e.sandbox.__autoApplyTakeover.applyToOpenJob({ title: "Python Developer" });
 
   assert.equal(result.submitted, false);
-  assert.equal(result.applicationStatus, "APPLICATION_NOT_SUBMITTED");
   assert.match(result.reason, /did not open/i);
 });
 
@@ -239,7 +288,7 @@ test("the generic observer reports a login wall as login, not as an application"
 });
 
 // ---------------------------------------------------------------------------
-// Naukri — loaded exactly as the manifest declares it
+// What the manifest actually loads
 // ---------------------------------------------------------------------------
 
 test("every host the manifest covers loads a complete agent", () => {
@@ -273,76 +322,15 @@ test("the agent runs on an arbitrary company site, not only the job boards", () 
   assert.equal(e.sandbox.__autoApplyTakeover.adapterForCurrentPage().name, "generic");
 });
 
-test("the Naukri adapter loads and exposes the API its callers use", () => {
-  const e = createEnvironment({
-    scripts: NAUKRI,
-    url: "https://www.naukri.com/job-listings-x-1",
-  });
-
-  assert.equal(typeof e.sandbox.naukriObserver.observe, "function");
-  assert.equal(typeof e.sandbox.naukriObserver.isComplete, "function");
-  assert.equal(typeof e.sandbox.naukriExecutor.executeAction, "function");
-  assert.equal(typeof e.sandbox.naukriAgentLoop.runAgentLoop, "function");
-  assert.equal(typeof e.sandbox.naukriApply.apply, "function");
-});
-
-test("Naukri reports state ready and ranks its Apply button", () => {
-  const e = createEnvironment({
-    scripts: NAUKRI,
-    url: "https://www.naukri.com/job-listings-x-1",
-  });
-  e.make("button", { id: "apply-button", text: "Apply", rect: { x: 400, y: 200, width: 100, height: 40 } });
-
-  const snapshot = e.sandbox.naukriObserver.observe();
-  assert.equal(snapshot.page.applicationState, "ready");
-  assert.equal(snapshot.page.platform, "naukri");
-  assert.equal(snapshot.applyCandidates[0].name, "Apply");
-});
-
-test("Naukri accepts a plain confirmation banner, not only its own markers", () => {
-  // Some Naukri flows render a confirmation without the appliedTag markers.
-  // Missing it made the agent report a successful application as a skip.
-  const e = createEnvironment({ scripts: NAUKRI, url: "https://www.naukri.com/job-listings-x-1" });
-  e.make("h1", { text: "Application submitted", rect: { width: 400, height: 30 } });
-
-  assert.equal(e.sandbox.naukriObserver.isComplete(), true);
-  assert.equal(e.sandbox.naukriObserver.observe().page.applicationState, "done");
-});
-
-test("a Naukri results page is never mistaken for a completed application", () => {
-  // The guard on the above: whole-page text on a results page contains other
-  // jobs' statuses, which must not read as this application being submitted.
-  const e = createEnvironment({ scripts: NAUKRI, url: "https://www.naukri.com/python-jobs" });
-  e.make("div", { text: "Recommended jobs", rect: { width: 300, height: 24 } });
-  e.make("div", { text: "Application sent 2 days ago", rect: { width: 300, height: 24 } });
-
-  assert.equal(e.sandbox.naukriObserver.isComplete(), false);
-});
-
-test("Naukri surfaces questionnaire controls the old exact-match filter would have dropped", () => {
-  const e = createEnvironment({
-    scripts: NAUKRI,
-    url: "https://www.naukri.com/job-listings-x-1",
-  });
-  const panel = e.make("div", { class: "singleselect-radiobutton", rect: { x: 0, y: 0, width: 600, height: 400 } });
-  e.make("button", { text: "Update my profile instead", rect: { width: 200, height: 36 } }, panel);
-  e.make("button", { text: "Save", rect: { width: 80, height: 36 } }, panel);
-
-  const labels = e.sandbox.naukriObserver.observe().elements.map((x) => x.text);
-  // The old filter accepted only ^(save|send|next|submit|apply|continue|proceed|done|ok)$.
-  assert.ok(labels.includes("Save"));
-  assert.ok(labels.includes("Update my profile instead"));
-});
-
 // ---------------------------------------------------------------------------
-// Shared behaviour across adapters
+// Shared behaviour
 // ---------------------------------------------------------------------------
 
-test("every adapter produces the same snapshot shape", () => {
-  const linkedin = createEnvironment({ scripts: LINKEDIN, url: "https://www.linkedin.com/jobs/view/1" });
-  const generic = createEnvironment({ scripts: GENERIC, url: "https://acme.test/jobs/1" });
+test("a snapshot has the same shape on every site", () => {
+  const sites = ["https://www.linkedin.com/jobs/view/1", "https://in.indeed.com/viewjob?jk=abc",
+                 "https://www.naukri.com/job-listings-x-1", "https://acme.test/jobs/1"];
 
-  for (const snapshot of [linkedin.sandbox.linkedinObserver.observe(), generic.sandbox.genericObserver.observe()]) {
+  for (const snapshot of sites.map((url) => board(url).sandbox.genericObserver.observe())) {
     for (const key of ["page", "questions", "elements", "controls", "applyCandidates", "errors", "loading", "fingerprint"]) {
       assert.ok(key in snapshot, `every snapshot must carry "${key}"`);
     }

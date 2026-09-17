@@ -17,12 +17,17 @@ async function recent() {
 }
 
 /**
+ * @param {object} [opts]
+ * @param {boolean} [opts.requireEnabled]  Consult the master switch. A takeover
+ *   run passes false: the user pressing "Take over" on the page they are
+ *   watching is the go-ahead the switch exists to give. The caps and the
+ *   breaker below still apply — those are what protect the account.
  * @returns {Promise<{ok: boolean, reason?: string, waitMs?: number}>}
  */
-export async function canSubmit() {
+export async function canSubmit({ requireEnabled = true } = {}) {
   const { governor } = await getSettings();
 
-  if (!governor.enabled) return { ok: false, reason: "kill switch is off" };
+  if (requireEnabled && !governor.enabled) return { ok: false, reason: "kill switch is off" };
   if (await get("haltedAt")) return { ok: false, reason: await get("haltReason") };
 
   const log = await recent();

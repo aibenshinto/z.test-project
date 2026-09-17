@@ -281,7 +281,7 @@ export function hasProgressEvidence(text) {
  *
  * Refuses to claim submission on weak evidence. "The Apply button was clicked"
  * and "the modal opened" are NOT submission. An adapter's own authoritative
- * check (`adapterConfirmed`, e.g. naukriApplicationSubmitted()) is.
+ * check (`adapterConfirmed`) is.
  *
  * @param {object} evidence
  * @param {boolean} [evidence.adapterConfirmed]  Platform-specific proof
@@ -622,7 +622,10 @@ const SECURITY_PATTERNS = [
  * @returns {{blocked: boolean, kind: string|null, reason: string}}
  */
 export function detectSecurityChallenge(signals = {}) {
-  const { pageText = "", frameSources = [], passwordFieldVisible = false } = signals;
+  const {
+    pageText = "", frameSources = [], passwordFieldVisible = false,
+    authWall = false, pathname = "",
+  } = signals;
 
   for (const src of frameSources) {
     if (/recaptcha|hcaptcha|turnstile|captcha|checkpoint/i.test(String(src))) {
@@ -642,7 +645,13 @@ export function detectSecurityChallenge(signals = {}) {
     };
   }
 
-  if (passwordFieldVisible && /\bsign in\b|\blog ?in\b/i.test(pageText)) {
+  // Signed out. Either the page asks for a password, or the board has put its
+  // own wall in the way. The path counts too: a board that bounces a job link
+  // to /login or /checkpoint has ended the run whatever the page says. The
+  // agent never signs in on the user's behalf.
+  const signInPath = /\/(?:log-?in|sign-?in|checkpoint|authwall|uas\/login)(?:\/|$)/i.test(pathname);
+  const signInWording = /\bsign in\b|\blog ?in\b|\bjoin now\b/i.test(pageText);
+  if ((passwordFieldVisible || authWall) && (signInWording || signInPath)) {
     return {
       blocked: true,
       kind: "login",

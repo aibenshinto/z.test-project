@@ -293,7 +293,10 @@
   }
 
   function detectSecurityChallenge(signals = {}) {
-    const { pageText = "", frameSources = [], passwordFieldVisible = false } = signals;
+    const {
+      pageText = "", frameSources = [], passwordFieldVisible = false,
+      authWall = false, pathname = "",
+    } = signals;
     for (const src of frameSources) {
       if (/recaptcha|hcaptcha|turnstile|captcha|checkpoint/i.test(String(src))) {
         return { blocked: true, kind: "captcha", reason: "A CAPTCHA or security challenge frame is present. The agent will not attempt to solve or bypass it." };
@@ -302,7 +305,9 @@
     if (SECURITY_PATTERNS.some((re) => re.test(pageText))) {
       return { blocked: true, kind: "challenge", reason: "A security or verification challenge was detected. The agent will not attempt to bypass it." };
     }
-    if (passwordFieldVisible && /\bsign in\b|\blog ?in\b/i.test(pageText)) {
+    const signInPath = /\/(?:log-?in|sign-?in|checkpoint|authwall|uas\/login)(?:\/|$)/i.test(pathname);
+    const signInWording = /\bsign in\b|\blog ?in\b|\bjoin now\b/i.test(pageText);
+    if ((passwordFieldVisible || authWall) && (signInWording || signInPath)) {
       return { blocked: true, kind: "login", reason: "A login wall was detected. Please sign in manually, then resume." };
     }
     return { blocked: false, kind: null, reason: "" };

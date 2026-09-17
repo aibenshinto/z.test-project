@@ -93,8 +93,7 @@ export function findSimilarAnswer(bank, question, threshold = 0.72) {
 }
 
 /**
- * Coarse classification shared by adapters. Naukri still has tighter templates
- * in the content script; this covers generic ATS wording.
+ * Coarse classification of a screening question, by its wording alone.
  */
 export function classifyQuestion(question) {
   const q = (question || "").toLowerCase();

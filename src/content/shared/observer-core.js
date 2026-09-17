@@ -1,7 +1,7 @@
 // Shared UI observation core (content-script side).
 //
 // One implementation of "what interactive controls is the user looking at?",
-// used by the Naukri, LinkedIn and generic adapters. Previously each adapter
+// used by the page adapter. Previously each per-site adapter
 // carried its own near-identical copy, and each copy filtered buttons through
 // a hardcoded job-application word list — which hid legitimate controls such
 // as "Start application" or "Get started" from the model.
@@ -489,10 +489,19 @@
 
     const passwordField = document.querySelector("input[type='password']");
 
+    // A board that has signed the user out puts its own panel in the way
+    // instead of a plain form — LinkedIn's auth wall, a "join to continue"
+    // overlay, a checkpoint interstitial.
+    const wall = document.querySelector(
+      "[class*='auth-wall'], [class*='authwall'], [class*='join-form'], [class*='challenge']",
+    );
+
     return {
       pageText: visibleBodyText(2500),
       frameSources,
       passwordFieldVisible: Boolean(passwordField && isVisible(passwordField)),
+      authWall: Boolean(wall && isVisible(wall)),
+      pathname: location.pathname,
     };
   }
 

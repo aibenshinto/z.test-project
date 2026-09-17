@@ -11,7 +11,7 @@ const PROFILE_SCHEMA = {
   type: "object",
   properties: {
     fullName: { type: "string" },
-    headline: { type: "string", description: "One line, over 50 characters - Naukri requires this" },
+    headline: { type: "string", description: "One line; some job boards expect 50+ characters" },
     location: { type: "string" },
     preferredLocations: { type: "array", items: { type: "string" } },
     totalYears: { type: "number" },
@@ -170,8 +170,12 @@ export function validateProfile(p) {
   if (typeof p.totalYears !== "number" || p.totalYears < 0 || p.totalYears > 60) {
     problems.push("totalYears is missing or implausible");
   }
+  // A short headline is not a reason to refuse to apply anywhere. Some boards
+  // impose their own minimum and will say so themselves; the agent reports
+  // that when it happens rather than blocking every site for it.
+  const warnings = [];
   if (!p.headline || p.headline.length < 50) {
-    problems.push("headline under 50 characters - Naukri rejects these");
+    warnings.push("a headline of 50+ characters is expected by some job boards");
   }
-  return { ok: problems.length === 0, problems };
+  return { ok: problems.length === 0, problems, warnings };
 }

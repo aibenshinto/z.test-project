@@ -8,7 +8,7 @@
 // tabs. The page the user is looking at is the source of truth.
 //
 // Job cards are found semantically — a link to a job detail URL, grouped by
-// its surrounding card — so this works on Naukri, LinkedIn and most listing
+// its surrounding card — so this works on any board and most listing
 // pages without per-site selectors. Platform adapters may supply a hint.
 
 (function () {

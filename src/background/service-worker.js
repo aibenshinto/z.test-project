@@ -1,25 +1,36 @@
-// Orchestrator. The service worker is evicted after ~30s idle, so the run loop
-// is driven by chrome.alarms + storage, never by setTimeout or module state.
+// Orchestrator.
+//
+// The agent runs in the tab the user is watching: they search, press "Take
+// over", and the content scripts work down that page. The worker is not a run
+// loop — it is the privileged half of that session. It does the things a
+// content script cannot: talk to a model, hold the API keys, read the profile
+// and resume, and see across tabs.
+//
+// There is no background queue and no hidden tab. An earlier version scraped a
+// search into a stored queue and applied in tabs the user never saw; it only
+// ever worked on two job boards, because a queue needs a per-site scraper and
+// a per-site apply message. Walking whatever results page the user is already
+// on needs neither, which is what makes the agent work on any job board.
+//
+// The worker is evicted after ~30s idle, so nothing that must survive lives in
+// module scope. The one exception is the record of which tab opened which,
+// which is only meaningful while a run is in progress and messaging the worker
+// constantly.
 
-import { getSettings, get, set, deleteAllUserData } from "../lib/storage.js";
-import { canSubmit, recordSubmit, halt, clearHalt, stats, randomDelay } from "./governor.js";
-import { resolve as resolveAnswer, remember } from "../lib/answer-bank.js";
+import { getSettings, deleteAllUserData } from "../lib/storage.js";
+import { canSubmit, recordSubmit, halt, clearHalt, stats } from "./governor.js";
+import { resolve as resolveAnswer } from "../lib/answer-bank.js";
 import { getResume, getProfile, parseResume, storeResume } from "../lib/resume.js";
-import { evaluateJob, evaluateJobWithModel } from "../lib/evaluator.js";
-import { modelRerank } from "../lib/ranker.js";
+import { evaluateJobWithModel } from "../lib/evaluator.js";
 import { askJSON } from "../lib/llm/index.js";
-import { emptySession, transition, STATES } from "../lib/agent-fsm.js";
 import { info, warn, getLog } from "../lib/logger.js";
-import { platformFromJob, platformFromUrl, isApplicationReceiptUrl } from "../lib/platforms.js";
+import { isApplicationReceiptUrl } from "../lib/boards.js";
 import { profileHintForQuestion } from "../lib/questions.js";
-import { decideAction, buildCandidateContext } from "../lib/ui-agent.js";
+import { decideAction } from "../lib/ui-agent.js";
 import {
   isDebugEnabled, setDebugEnabled, recordDiagnostic, getDiagnostics,
   clearDiagnostics, captureViewport, captureForModel, storeFailureCapture, getCaptures,
 } from "../lib/debug-store.js";
-
-const TICK = "autoapply-tick";
-const SESSION = "agentSession";
 
 async function persistApplyTrace(entry) {
   const { applyTrace = [] } = await chrome.storage.local.get("applyTrace");
@@ -45,18 +56,8 @@ function safeHttpUrl(raw) {
   }
 }
 
-function adapterResult(value, fallbackReason = "The platform did not return a completion confirmation.") {
-  if (!value) return { submitted: false, reason: fallbackReason };
-  if (value.ok === false) return { submitted: false, reason: value.error || fallbackReason };
-  return value;
-}
-
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
-});
-
-chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === TICK) await tick();
 });
 
 // ---- Tabs opened by pages ---------------------------------------------------
@@ -79,11 +80,11 @@ chrome.tabs.onRemoved.addListener((tabId) => openedTabs.delete(tabId));
  * The most recent still-open tab that `openerTabId` opened at or after
  * `since`, waiting up to `waitMs` for its creation event to arrive.
  *
- * One click can open two tabs: Naukri's "Apply on company site" opens the
- * company's page and its own receipt page. The receipt is never the
- * application, so it is passed over while any other candidate exists — and
- * taken only when it is the only thing that opened, so the caller can say
- * what happened.
+ * One click can open two tabs: an apply control can open the company's own
+ * application and, alongside it, the board's record of the click. The receipt
+ * is never the application, so it is passed over while any other candidate
+ * exists — and taken only when it is the only thing that opened, so the caller
+ * can say what happened.
  */
 async function tabOpenedBy(openerTabId, since, waitMs = 0) {
   const deadline = Date.now() + Math.min(Number(waitMs) || 0, 5000);
@@ -117,6 +118,32 @@ async function tabOpenedBy(openerTabId, since, waitMs = 0) {
 async function closeReceiptTab(tabId) {
   await waitForTab(tabId).catch(() => {});
   await chrome.tabs.remove(tabId).catch(() => {});
+}
+
+/**
+ * Only a tab that the asking page itself opened may be adopted or closed.
+ * The record taken at creation counts too: Chrome can clear a tab's live
+ * `openerTabId` once the user switches tabs.
+ */
+async function childTab(openerTabId, tabId) {
+  const tab = await chrome.tabs.get(Number(tabId)).catch(() => null);
+  if (!tab) return null;
+  const opener = openedTabs.get(tab.id)?.openerTabId ?? tab.openerTabId;
+  return opener === openerTabId ? tab : null;
+}
+
+function waitForTab(tabId, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = async () => {
+      const t = await chrome.tabs.get(tabId).catch(() => null);
+      if (!t) return reject(new Error("tab closed"));
+      if (t.status === "complete") return resolve();
+      if (Date.now() > deadline) return reject(new Error("tab load timeout"));
+      setTimeout(poll, 250);
+    };
+    poll();
+  });
 }
 
 /**
@@ -208,13 +235,42 @@ function jobFromCard({ title = "", company = "", url = "", text = "" }) {
   return {
     id: url, url, title, company,
     summary: body,
-    experience: (body.match(/\d+\s*-\s*\d+\s*yrs?/i) || [""])[0],
+    experience: experienceFromText(body),
     // The card does not mark which part is the location; the scorer only
     // looks for preferred cities (or "remote") in it, so the whole card works.
     location: body,
-    postedOn: (body.match(/\b(?:just now|today|few hours ago|\d+\+?\s*(?:day|week|month)s?\s+ago)\b/i) || [""])[0],
+    postedOn: postedFromText(body),
     tags: [],
   };
+}
+
+/**
+ * The experience a card asks for, in whatever way its board words it.
+ *
+ * Boards disagree: "2-5 Yrs", "3+ years", "Minimum 4 years experience",
+ * "Entry level". Reading only the first form meant every other board scored
+ * every job as "experience unknown", which silently disabled the experience
+ * gate rather than failing loudly.
+ */
+function experienceFromText(text) {
+  const patterns = [
+    /\b\d+\s*-\s*\d+\s*(?:yrs?|years?)\b/i,     // 2-5 Yrs
+    /\b\d+\s*\+\s*(?:yrs?|years?)\b/i,          // 3+ years
+    /\b(?:min(?:imum)?|at least)\s*\d+\s*(?:yrs?|years?)\b/i,
+    /\b\d+\s*(?:yrs?|years?)(?:\s+of)?\s+(?:exp|experience)\b/i,
+  ];
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (m) return m[0];
+  }
+  if (/\b(?:entry[- ]level|fresher|graduate|no experience required)\b/i.test(text)) return "0 years";
+  return "";
+}
+
+/** When a card says the job was posted, in whatever way its board words it. */
+function postedFromText(text) {
+  const m = /\b(?:just now|today|yesterday|few hours ago|\d+\+?\s*(?:hour|day|week|month)s?\s+ago|posted\s+\d+\+?\s*(?:hour|day|week|month)s?\s+ago)\b/i.exec(text);
+  return m ? m[0] : "";
 }
 
 function fitReason(ev) {
@@ -226,733 +282,15 @@ function fitReason(ev) {
   return `${verdict} (${ev.match_score}% match)${why ? `: ${why}` : ""}`;
 }
 
-/**
- * Only a tab that the asking page itself opened may be adopted or closed.
- * The record taken at creation counts too: Chrome can clear a tab's live
- * `openerTabId` once the user switches tabs.
- */
-async function childTab(openerTabId, tabId) {
-  const tab = await chrome.tabs.get(Number(tabId)).catch(() => null);
-  if (!tab) return null;
-  const opener = openedTabs.get(tab.id)?.openerTabId ?? tab.openerTabId;
-  return opener === openerTabId ? tab : null;
-}
-
-async function loadSession() {
-  return (await get(SESSION, null)) || emptySession();
-}
-
-async function saveSession(s) {
-  await set(SESSION, s);
-  return s;
-}
-
-export async function startRun() {
-  await clearHalt();
-  let s = await loadSession();
-  s = { ...emptySession(), paused: false, state: STATES.IDLE };
-  s = transition(s, STATES.DISCOVERING_JOB, { progress: { step: 0, total: 0, action: "starting" } });
-  await saveSession(s);
-  await chrome.alarms.create(TICK, { periodInMinutes: 1 });
-  await info("Run started");
-  await tick();
-}
-
-export async function stopRun(reason = "stopped by user") {
-  await chrome.alarms.clear(TICK);
-  const s = await loadSession();
-  await saveSession({ ...s, state: STATES.STOPPED, paused: false, pendingQuestion: null, lastError: reason, updatedAt: Date.now() });
-  await halt(reason);
-  await info("Run stopped", { reason });
-}
-
-export async function pauseRun() {
-  const s = await loadSession();
-  try {
-    await saveSession(transition(s, STATES.PAUSED, { paused: true, progress: { ...s.progress, action: "paused" } }));
-  } catch {
-    await saveSession({ ...s, state: STATES.PAUSED, paused: true, updatedAt: Date.now() });
-  }
-  await chrome.alarms.clear(TICK);
-  await info("Run paused");
-}
-
-export async function resumeRun() {
-  await clearHalt();
-  let s = await loadSession();
-  s = { ...s, paused: false };
-  if (s.state === STATES.PAUSED || s.state === STATES.STOPPED) {
-    const next = s.pendingQuestion ? STATES.WAITING_FOR_USER : STATES.DISCOVERING_JOB;
-    try { s = transition({ ...s, state: STATES.PAUSED }, next, { paused: false }); }
-    catch { s = { ...s, state: next, paused: false, updatedAt: Date.now() }; }
-  }
-  await saveSession(s);
-  await chrome.alarms.create(TICK, { periodInMinutes: 1 });
-  await info("Run resumed");
-  await tick();
-}
-
-function force(session, state, patch = {}) {
-  try {
-    return transition(session, state, patch);
-  } catch {
-    return { ...session, ...patch, state, updatedAt: Date.now() };
-  }
-}
-
-/** A job is already known when its stable platform id, canonical URL, or a
- * submitted company/title pair is present. Keep this in the worker so every
- * platform uses the same duplicate policy. */
-function duplicateOf(queue, job) {
-  return queue.some((j) =>
-    (j.id && job.id && j.id === job.id) ||
-    (j.url && job.url && j.url === job.url) ||
-    (j.company && j.title && j.company === job.company && j.title === job.title &&
-      ["submitted", "applied", "APPLYING"].includes(j.status))
-  );
-}
-
-let tickRunning = false;
-
-// One unit of work per tick: take the highest-ranked queued job and try it.
-async function tick() {
-  if (tickRunning) return;
-  tickRunning = true;
-  try {
-    const session = await loadSession();
-    if (session.paused || session.state === STATES.STOPPED) return;
-    if (session.state === STATES.WAITING_FOR_USER || session.state === STATES.BLOCKED) {
-      await info("Holding for user", { state: session.state });
-      return;
-    }
-
-  const gate = await canSubmit();
-  if (!gate.ok) {
-    console.debug("[tick] holding:", gate.reason);
-    if (gate.waitMs) {
-      await chrome.alarms.create(TICK, { when: Date.now() + gate.waitMs + 1000 });
-    }
-    return;
-  }
-
-  const queue = await get("queue", []);
-  const settings = await getSettings();
-  const profile = await getProfile();
-  const next = queue
-    .filter((j) => j.status === "ready")
-    .sort((a, b) => (b.relevance || 0) - (a.relevance || 0))[0];
-
-  if (!next) {
-    await saveSession({ ...emptySession(), updatedAt: Date.now() });
-    return;
-  }
-
-  let s = emptySession();
-  s = transition(s, STATES.DISCOVERING_JOB, { jobId: next.id });
-  s = transition(s, STATES.EVALUATING_JOB, { jobId: next.id });
-
-  // Discovery stays local and cheap. Just before a real application, obtain
-  // one structured, conservative model judgement for the selected job. A
-  // model failure falls back to the deterministic evaluation in this module.
-  const ev = await evaluateJobWithModel(next, profile || {}, askJSON, {
-    minRelevance: settings.governor.minRelevance,
-    preferences: settings.preferences,
-  });
-
-  // Check if the user paused or stopped the run while the model was evaluating.
-  const postEvalSession = await loadSession();
-  if (postEvalSession.paused || postEvalSession.state === STATES.STOPPED) return;
-
-  next.evaluation = ev;
-  next.relevance = ev.relevance;
-  next.match_score = ev.match_score;
-  await info("Job evaluated", { title: next.title, decision: ev.decision, match_score: ev.match_score });
-
-  if (ev.decision === "SKIP") {
-    next.status = "skipped";
-    next.result = { reason: ev.reasons.join("; ") };
-    await set("queue", queue);
-    try { s = transition(s, STATES.SKIPPED, { progress: { action: "skipped", step: 0, total: 0 } }); }
-    catch { s = { ...s, state: STATES.SKIPPED }; }
-    await saveSession(s);
-    await chrome.alarms.create(TICK, { when: Date.now() + 1500 });
-    return;
-  }
-
-  if (ev.decision === "REVIEW") {
-    next.status = "review";
-    next.result = { reason: "Needs review: " + ev.reasons.slice(0, 2).join("; ") };
-    await set("queue", queue);
-    try { s = transition(s, STATES.SKIPPED, { progress: { action: "queued for review" } }); }
-    catch { s = { ...s, state: STATES.SKIPPED }; }
-    await saveSession(s);
-    await chrome.alarms.create(TICK, { when: Date.now() + 1500 });
-    return;
-  }
-
-  if ((next.relevance || 0) < settings.governor.minRelevance) {
-    next.status = "skipped";
-    await set("queue", queue);
-    return;
-  }
-
-  try {
-    try { s = transition(s, STATES.OPENING_APPLICATION, { progress: { action: "opening", step: 1, total: 5 } }); }
-    catch { s.state = STATES.OPENING_APPLICATION; }
-    await saveSession(s);
-
-    const result = await applyToJob(next, s);
-    const traceEntryReceived = { stage: "worker_received", jobId: next.id, title: next.title, company: next.company, url: next.url, result, submitted: result?.submitted };
-    console.log("[APPLY_TRACE]", JSON.stringify(traceEntryReceived));
-    await persistApplyTrace(traceEntryReceived);
-    
-    next.status = result.submitted ? "submitted"
-      : result.waitingForUser ? "waiting_for_user"
-      : result.blocked ? "blocked"
-      : result.halt ? "blocked"
-      : "needs_review";
-    next.result = result;
-
-    if (result.submitted) {
-      const traceEntryRecordSubmit = { stage: "tick_recordSubmit_called", site: next.site, jobId: next.id, title: next.title, company: next.company, url: next.url };
-      console.log("[APPLY_TRACE]", JSON.stringify(traceEntryRecordSubmit));
-      await persistApplyTrace(traceEntryRecordSubmit);
-      await recordSubmit(next);
-      const traceStats = { stage: "stats_after_submit", stats: await stats() };
-      console.log("[APPLY_TRACE]", JSON.stringify(traceStats));
-      await persistApplyTrace(traceStats);
-    } else {
-      const traceEntryNotCalled = { stage: "tick_result_false", site: next.site, jobId: next.id, title: next.title, company: next.company, url: next.url, reason: result?.reason };
-      console.log("[APPLY_TRACE]", JSON.stringify(traceEntryNotCalled));
-      await persistApplyTrace(traceEntryNotCalled);
-    }
-    if (!result.submitted) {
-      await warn("Application requires attention", {
-        jobId: next.id,
-        title: next.title,
-        status: next.status,
-        // APPLICATION_STATUS_UNKNOWN means the agent acted but could not prove
-        // the application was submitted — distinct from a confirmed failure.
-        applicationStatus: result.applicationStatus || "APPLICATION_STATUS_UNKNOWN",
-        reason: result.reason || "The platform did not return a completion confirmation.",
-      });
-    }
-
-    if (result.halt) {
-      await set("queue", queue);
-      await saveSession({ ...await loadSession(), state: STATES.BLOCKED, lastError: result.reason });
-      return halt(result.reason);
-    }
-
-    if (result.waitingForUser) {
-      await set("queue", queue);
-      return;
-    }
-
-    if (result.blocked) {
-      await set("queue", queue);
-      return;
-    }
-  } catch (err) {
-    next.status = "error";
-    next.error = String(err);
-    await warn("Application failed", {
-      jobId: next.id,
-      title: next.title,
-      reason: String(err && err.message ? err.message : err),
-    });
-    if (err && err.retryable) {
-      console.warn("[tick] provider unavailable, will retry next tick:", err.message);
-      next.status = "ready";
-      await set("queue", queue);
-      return chrome.alarms.create(TICK, { when: Date.now() + 120000 });
-    }
-
-    if (/captcha|verify|blocked|unexpected dom|cloudflare/i.test(String(err))) {
-      next.status = "blocked";
-      await set("queue", queue);
-      await saveSession({
-        ...(await loadSession()),
-        state: STATES.BLOCKED,
-        lastError: String(err),
-        pendingQuestion: {
-          kind: "blocked",
-          question: "Application blocked",
-          reason: String(err),
-        },
-        updatedAt: Date.now(),
-      });
-      await halt(`anomaly on ${next.id}: ${err}`);
-      return;
-    }
-  }
-
-  await set("queue", queue);
-  await chrome.alarms.create(TICK, {
-    when: Date.now() + randomDelay(settings.governor),
-  });
-  } finally {
-    tickRunning = false;
-  }
-}
-
-async function applyToJob(job, session) {
-  const existing = session.tabId;
-  let tabId = existing;
-  if (tabId) {
-    const t = await chrome.tabs.get(tabId).catch(() => null);
-    if (!t) tabId = null;
-  }
-  if (!tabId) {
-    const tab = await chrome.tabs.create({ url: job.url, active: true });
-    tabId = tab.id;
-  }
-  await saveSession({
-    ...(await loadSession()),
-    tabId,
-    jobId: job.id,
-    state: STATES.OPENING_APPLICATION,
-    updatedAt: Date.now(),
-  });
-
-  try {
-    await waitForTab(tabId);
-    const platform = platformFromJob(job);
-    await saveSession({
-      ...(await loadSession()),
-      state: STATES.ANSWERING_FORM,
-      progress: { step: 2, total: 5, action: "answering questions" },
-      updatedAt: Date.now(),
-    });
-    const traceSend = { stage: "applyToJob_sending", site: job.site, jobId: job.id, title: job.title, company: job.company, url: job.url };
-    console.log("[APPLY_TRACE]", JSON.stringify(traceSend));
-    await persistApplyTrace(traceSend);
-    let result = adapterResult(await chrome.tabs.sendMessage(tabId, { type: platform.applyMessage, job }));
-    const traceReceived = { stage: "applyToJob_received", result };
-    console.log("[APPLY_TRACE]", JSON.stringify(traceReceived));
-    await persistApplyTrace(traceReceived);
-
-    if (result && result.waitingForUser) {
-      await saveSession({
-        ...(await loadSession()),
-        state: STATES.WAITING_FOR_USER,
-        tabId,
-        pendingQuestion: {
-          kind: "field",
-          question: result.question,
-          suggested: result.suggested || "",
-          confirm: result.confirm,
-          profileHint: result.profileHint || profileHintForQuestion(result.question),
-        },
-        progress: { step: 3, total: 5, action: "waiting for you" },
-        updatedAt: Date.now(),
-      });
-      await info("User input required", { question: result.question });
-      // Bring the stuck tab to the front so the user can see where the agent paused.
-      await chrome.tabs.update(tabId, { active: true }).catch(() => {});
-      return result;
-    }
-
-    if (result && (result.blocked || /captcha/i.test(result.reason || ""))) {
-      await saveSession({
-        ...(await loadSession()),
-        state: STATES.BLOCKED,
-        tabId,
-        lastError: result.reason,
-        pendingQuestion: { kind: "blocked", reason: result.reason, question: result.reason },
-        updatedAt: Date.now(),
-      });
-      return { ...result, blocked: true };
-    }
-
-    if (result && result.external) {
-      if (!result.externalUrl) {
-        const discoveredUrl = await discoverExternalCompanyUrl(tabId);
-        if (!discoveredUrl) {
-          result = {
-            ...result,
-            reason: "Naukri’s “Apply on company site” button was clicked, but no external HTTPS page opened within 12 seconds.",
-          };
-          await chrome.tabs.remove(tabId).catch(() => {});
-          await saveSession({
-            ...(await loadSession()),
-            state: STATES.FAILED,
-            tabId: null,
-            lastError: result.reason,
-            updatedAt: Date.now(),
-          });
-          return result;
-        }
-        result = { ...result, externalUrl: discoveredUrl };
-      }
-      return handoffToExternalApplication(job, tabId, result);
-    }
-
-    if (result && result.submitted) {
-      await saveSession({
-        ...(await loadSession()),
-        state: STATES.COMPLETED,
-        tabId: null,
-        pendingQuestion: null,
-        progress: { step: 5, total: 5, action: "submitted" },
-        updatedAt: Date.now(),
-      });
-      await chrome.tabs.remove(tabId).catch(() => {});
-      await info("Application submitted", { jobId: job.id });
-      return result;
-    }
-
-    await chrome.tabs.remove(tabId).catch(() => {});
-    await saveSession({
-      ...(await loadSession()),
-      tabId: null,
-      state: STATES.FAILED,
-      lastError: result && result.reason,
-      updatedAt: Date.now(),
-    });
-    return result || { submitted: false, reason: "no result from adapter" };
-  } catch (err) {
-    await chrome.tabs.remove(tabId).catch(() => {});
-    throw err;
-  }
-}
-
-function waitForTab(tabId, timeoutMs = 30000) {
-  return new Promise((resolve, reject) => {
-    const deadline = Date.now() + timeoutMs;
-    const poll = async () => {
-      const t = await chrome.tabs.get(tabId).catch(() => null);
-      if (!t) return reject(new Error("tab closed"));
-      if (t.status === "complete") return resolve();
-      if (Date.now() > deadline) return reject(new Error("tab load timeout"));
-      setTimeout(poll, 250);
-    };
-    poll();
-  });
-}
-
-async function userAnswerAndContinue(answer) {
-  const session = await loadSession();
-  const queue = await get("queue", []);
-  const job = queue.find((j) => j.id === session.jobId) || queue.find((j) => j.status === "waiting_for_user");
-  if (!job) return { ok: false, error: "no job waiting" };
-  if (session.pendingQuestion?.question) {
-    await remember(session.pendingQuestion.question, answer, { source: "user", confidence: 1 });
-  }
-  let s = session;
-  try { s = transition(session, STATES.ANSWERING_FORM, { pendingQuestion: null, paused: false }); }
-  catch { s = { ...session, state: STATES.ANSWERING_FORM, pendingQuestion: null }; }
-  await saveSession(s);
-
-  const tabId = session.tabId;
-  const tab = tabId ? await chrome.tabs.get(tabId).catch(() => null) : null;
-  if (!tab) {
-    job.status = "error";
-    job.error = "tab_closed";
-    await set("queue", queue);
-    await saveSession({ ...s, state: STATES.FAILED, lastError: "tab closed", tabId: null });
-    return { ok: false, error: "tab closed — job marked failed" };
-  }
-
-  const platform = platformFromJob(job);
-  // For the generic adapter: send GENERIC_CONTINUE so the agent-loop
-  // re-observes the current DOM state after the user filled a field manually.
-  const result = adapterResult(await chrome.tabs.sendMessage(tabId, {
-    type: session.adapter === "generic" ? "GENERIC_CONTINUE" : platform.continueMessage,
-    job,
-    answer,
-  }));
-  job.result = result;
-  if (result && result.waitingForUser) {
-    job.status = "waiting_for_user";
-    await set("queue", queue);
-    await saveSession({
-      ...s,
-      state: STATES.WAITING_FOR_USER,
-      adapter: session.adapter,
-      pendingQuestion: {
-        kind: "field",
-        question: result.question,
-        suggested: result.suggested || "",
-        confirm: result.confirm,
-        profileHint: result.profileHint || profileHintForQuestion(result.question),
-      },
-      updatedAt: Date.now(),
-    });
-    return { ok: true, waiting: true };
-  }
-  if (result && result.submitted) {
-    const traceUac = { stage: "userAnswerAndContinue_recordSubmit_called", site: job.site, jobId: job.id, title: job.title, company: job.company, url: job.url };
-    console.log("[APPLY_TRACE]", JSON.stringify(traceUac));
-    await persistApplyTrace(traceUac);
-    job.status = "submitted";
-    await recordSubmit(job);
-    await chrome.tabs.remove(tabId).catch(() => {});
-    await set("queue", queue);
-    await saveSession({ ...emptySession(), state: STATES.COMPLETED, updatedAt: Date.now() });
-    await chrome.alarms.create(TICK, { when: Date.now() + 2000 });
-    return { ok: true, submitted: true };
-  }
-  if (result && result.blocked) {
-    job.status = "blocked";
-    await set("queue", queue);
-    await saveSession({
-      ...s,
-      state: STATES.BLOCKED,
-      lastError: result.reason,
-      pendingQuestion: { kind: "blocked", question: result.reason, reason: result.reason },
-      updatedAt: Date.now(),
-    });
-    await halt(`security block on ${job.id}: ${result.reason}`);
-    return { ok: true, blocked: true };
-  }
-  job.status = result && result.halt ? "blocked" : "needs_review";
-  await chrome.tabs.remove(tabId).catch(() => {});
-  await set("queue", queue);
-  await saveSession({ ...emptySession(), state: STATES.FAILED, lastError: result && result.reason, updatedAt: Date.now() });
-  await chrome.alarms.create(TICK, { when: Date.now() + 2000 });
-  return { ok: true, result };
-}
-
-async function discoverExternalCompanyUrl(sourceTabId, timeoutMs = 12000) {
-  const clicked = adapterResult(await chrome.tabs.sendMessage(sourceTabId, {
-    type: "OPEN_EXTERNAL_COMPANY_SITE",
-  }), "The company-site button could not be clicked.");
-  if (!clicked.clicked) return null;
-
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const source = await chrome.tabs.get(sourceTabId).catch(() => null);
-    if (source && permissionPatternFor(source.url)) return source.url;
-
-    const children = await chrome.tabs.query({ openerTabId: sourceTabId }).catch(() => []);
-    const destination = children.find((tab) => permissionPatternFor(tab.url));
-    if (destination?.url) {
-      await chrome.tabs.remove(destination.id).catch(() => {});
-      return destination.url;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  return null;
-}
-
-function permissionPatternFor(url) {
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== "https:" || /(^|\.)naukri\.com$/i.test(parsed.hostname)) return null;
-    return `${parsed.origin}/*`;
-  } catch {
-    return null;
-  }
-}
-
-async function handoffToExternalApplication(job, sourceTabId, result) {
-  const externalUrl = result.externalUrl;
-  const origin = permissionPatternFor(externalUrl);
-  if (!origin) {
-    await chrome.tabs.remove(sourceTabId).catch(() => {});
-    await saveSession({
-      ...(await loadSession()),
-      state: STATES.FAILED,
-      tabId: null,
-      lastError: result.reason || "External application has no safe HTTPS destination URL.",
-      updatedAt: Date.now(),
-    });
-    return { ...result, reason: result.reason || "External application has no safe HTTPS destination URL." };
-  }
-
-  job.externalApplication = { url: externalUrl, origin };
-  const granted = await chrome.permissions.contains({ origins: [origin] });
-  await chrome.tabs.remove(sourceTabId).catch(() => {});
-  if (!granted) {
-    await saveSession({
-      ...(await loadSession()),
-      state: STATES.WAITING_FOR_USER,
-      tabId: null,
-      pendingQuestion: {
-        kind: "external_permission",
-        question: `Allow AutoApply to assist on ${new URL(externalUrl).hostname}?`,
-        reason: "This company application is hosted outside Naukri. Permission is needed only for this website.",
-        externalUrl,
-        externalOrigin: origin,
-      },
-      progress: { step: 2, total: 5, action: "waiting for company-site permission" },
-      updatedAt: Date.now(),
-    });
-    await info("Company-site permission required", { jobId: job.id, origin });
-    return { waitingForUser: true, external: true, reason: "Permission is required to assist on the company website." };
-  }
-  return beginExternalApplication(job, externalUrl);
-}
-
-async function beginExternalApplication(job, externalUrl) {
-  // Open visibly so the user can watch the agent navigate the company site.
-  const tab = await chrome.tabs.create({ url: externalUrl, active: true });
-  const tabId = tab.id;
-  await saveSession({
-    ...(await loadSession()),
-    state: STATES.OPENING_APPLICATION,
-    tabId,
-    jobId: job.id,
-    pendingQuestion: null,
-    adapter: "generic",
-    progress: { step: 2, total: 5, action: "opening company application" },
-    updatedAt: Date.now(),
-  });
-  try {
-    await waitForTab(tabId);
-    // Inject in dependency order: highlight ring → observer → executor → agent-loop → shim
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: [
-        "src/content/shared/highlight.js",
-        "src/content/shared/interaction-core-bridge.js",
-        "src/content/shared/observer-core.js",
-        "src/content/shared/pointer-actions.js",
-        "src/content/shared/diagnostics.js",
-        "src/content/shared/executor-core.js",
-        "src/content/shared/agent-loop-core.js",
-        "src/content/generic/observer.js",
-        "src/content/generic/executor.js",
-        "src/content/generic/agent-loop.js",
-        "src/content/generic/apply.js",
-      ],
-    });
-    // Brief settle time for the agent-loop message listener to register.
-    await new Promise((r) => setTimeout(r, 300));
-    const result = adapterResult(await chrome.tabs.sendMessage(tabId, { type: "GENERIC_APPLY", job }),
-      "The company-site adapter did not return a result.");
-    job.result = result;
-    if (result?.waitingForUser) {
-      await saveSession({
-        ...(await loadSession()),
-        state: STATES.WAITING_FOR_USER,
-        tabId,
-        adapter: "generic",
-        pendingQuestion: {
-          kind: "field",
-          question: result.question,
-          suggested: result.suggested || "",
-          confirm: result.confirm,
-          profileHint: result.profileHint || profileHintForQuestion(result.question),
-        },
-        progress: { step: 3, total: 5, action: "waiting for you on company site" },
-        updatedAt: Date.now(),
-      });
-      await info("Company-site user input required", { jobId: job.id, question: result.question });
-      // Keep the tab open and bring it to front so the user sees exactly where to type.
-      await chrome.tabs.update(tabId, { active: true }).catch(() => {});
-      return result;
-    }
-    if (result?.blocked) {
-      await saveSession({
-        ...(await loadSession()),
-        state: STATES.BLOCKED,
-        tabId,
-        adapter: "generic",
-        lastError: result.reason,
-        pendingQuestion: { kind: "blocked", question: result.reason, reason: result.reason },
-        updatedAt: Date.now(),
-      });
-      await warn("Company-site application blocked", { jobId: job.id, reason: result.reason });
-      return result;
-    }
-    if (result?.submitted) {
-      await chrome.tabs.remove(tabId).catch(() => {});
-      await saveSession({ ...emptySession(), state: STATES.COMPLETED, updatedAt: Date.now() });
-      return result;
-    }
-    await chrome.tabs.remove(tabId).catch(() => {});
-    await saveSession({ ...emptySession(), state: STATES.FAILED, lastError: result?.reason, updatedAt: Date.now() });
-    await warn("Company-site application did not complete", { jobId: job.id, reason: result?.reason });
-    return result || { submitted: false, reason: "No result from the company-site adapter." };
-  } catch (error) {
-    await chrome.tabs.remove(tabId).catch(() => {});
-    throw error;
-  }
-}
-
-async function refreshPendingProfileAnswer() {
-  const session = await loadSession();
-  const pending = session.pendingQuestion;
-  if (!pending?.question || !pending.profileHint) return { ok: true, pending: false };
-  const profile = await getProfile();
-  const resolved = await resolveAnswer(pending.question, undefined, profile);
-  if (!resolved?.answer) return { ok: true, pending: true, suggested: false };
-  await saveSession({
-    ...session,
-    pendingQuestion: {
-      ...pending,
-      suggested: resolved.answer,
-      confirm: resolved.action === "CONFIRM",
-    },
-    updatedAt: Date.now(),
-  });
-  return { ok: true, pending: true, suggested: true, confirm: resolved.action === "CONFIRM" };
-}
-
-async function enableExternalSiteAndContinue() {
-  const session = await loadSession();
-  const pending = session.pendingQuestion;
-  if (pending?.kind !== "external_permission" || !pending.externalOrigin || !pending.externalUrl) {
-    return { ok: false, error: "no company-site permission is pending" };
-  }
-  // The request is initiated by the side-panel button, so Chrome shows the
-  // exact company origin before granting access.
-  const granted = await chrome.permissions.request({ origins: [pending.externalOrigin] });
-  if (!granted) {
-    await info("Company-site permission declined", { origin: pending.externalOrigin });
-    return { ok: false, error: "permission was not granted" };
-  }
-  const queue = await get("queue", []);
-  const job = queue.find((item) => item.id === session.jobId);
-  if (!job) return { ok: false, error: "job is no longer in the queue" };
-  await info("Company-site permission granted", { jobId: job.id, origin: pending.externalOrigin });
-  const result = await beginExternalApplication(job, pending.externalUrl);
-  job.result = result;
-  job.status = result?.submitted ? "submitted"
-    : result?.waitingForUser ? "waiting_for_user"
-    : result?.blocked ? "blocked"
-    : "needs_review";
-  if (result?.submitted) {
-    const traceExt = { stage: "enableExternalSiteAndContinue_recordSubmit_called", site: "generic", jobId: job.id, title: job.title, company: job.company, url: job.url };
-    console.log("[APPLY_TRACE]", JSON.stringify(traceExt));
-    await persistApplyTrace(traceExt);
-    await recordSubmit({ ...job, site: "generic" });
-  } else {
-    const traceExtFalse = { stage: "enableExternalSiteAndContinue_result_false", site: "generic", jobId: job.id, title: job.title, company: job.company, url: job.url, reason: result?.reason };
-    console.log("[APPLY_TRACE]", JSON.stringify(traceExtFalse));
-    await persistApplyTrace(traceExtFalse);
-  }
-  await set("queue", queue);
-  return { ok: true, result };
-}
-
-async function skipWaitingJob() {
-  const session = await loadSession();
-  const queue = await get("queue", []);
-  const job = queue.find((j) => j.id === session.jobId);
-  if (job) {
-    job.status = "skipped";
-    job.result = { reason: session.lastError || "skipped by user" };
-  }
-  if (session.tabId) await chrome.tabs.remove(session.tabId).catch(() => {});
-  await set("queue", queue);
-  await saveSession({ ...emptySession(), state: STATES.SKIPPED, updatedAt: Date.now() });
-  await chrome.alarms.create(TICK, { when: Date.now() + 1500 });
-  await info("User skipped job", { jobId: session.jobId });
-  return { ok: true };
-}
-
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     switch (msg.type) {
-      case "START":  await startRun();            return sendResponse({ ok: true });
-      case "STOP":   await stopRun();             return sendResponse({ ok: true });
-      case "PAUSE":  await pauseRun();            return sendResponse({ ok: true });
-      case "RESUME": await resumeRun();           return sendResponse({ ok: true });
       case "STATS":  return sendResponse(await stats());
-      case "RECORD_SUBMIT":
+
+      case "GET_STATUS":
+        return sendResponse({ ok: true, stats: await stats(), log: await getLog(40) });
+
+      case "RECORD_SUBMIT": {
         const traceRecSub = { stage: "RECORD_SUBMIT_handler", payload: msg.payload };
         console.log("[APPLY_TRACE]", JSON.stringify(traceRecSub));
         await persistApplyTrace(traceRecSub);
@@ -961,36 +299,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         console.log("[APPLY_TRACE]", JSON.stringify(traceRecSubStats));
         await persistApplyTrace(traceRecSubStats);
         return sendResponse({ ok: true });
-      case "GET_SESSION":
-        return sendResponse({
-          ok: true,
-          session: await loadSession(),
-          queue: await get("queue", []),
-          log: await getLog(40),
-        });
-      case "USER_ANSWER":
-        return sendResponse(await userAnswerAndContinue(msg.answer));
-      case "PROFILE_UPDATED":
-        return sendResponse(await refreshPendingProfileAnswer());
-      case "ENABLE_EXTERNAL_SITE":
-        return sendResponse(await enableExternalSiteAndContinue());
-      case "SKIP_JOB":
-        return sendResponse(await skipWaitingJob());
+      }
+
+      case "CLEAR_HALT":
+        await clearHalt();
+        return sendResponse({ ok: true });
+
       case "DELETE_DATA":
         await deleteAllUserData();
         return sendResponse({ ok: true });
 
-  
-    case "FOCUS_TAB": {
-      // Bring the current agent tab to the foreground (user wants to see where it paused).
-      const fSession = await loadSession();
-      if (fSession.tabId) {
-        await chrome.tabs.update(fSession.tabId, { active: true }).catch(() => {});
-        return sendResponse({ ok: true });
-      }
-      return sendResponse({ ok: false, error: "no active tab in session" });
-    }
-    case "AI_DECIDE_ACTION": {
+      case "AI_DECIDE_ACTION": {
         // The content script sends a UISnapshot; we return a validated AgentAction.
         // API keys never leave the service worker — this is the only correct
         // place to call the LLM for UI decisions.
@@ -1087,11 +406,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       // ---- Takeover: following a job into a new tab -----------------------
       //
-      // A job on Naukri or LinkedIn often opens the company's own application
-      // in a NEW tab. A content script cannot see or drive another tab, so the
-      // takeover session asks the worker to run the application there and
-      // report back. The user watches it happen: the tab is focused, never
-      // hidden, and it is closed only if the worker opened it.
+      // A job board often opens the company's own application in a NEW tab. A
+      // content script cannot see or drive another tab, so the takeover
+      // session asks the worker to run the application there and report back.
+      // The user watches it happen: the tab is focused, never hidden, and it
+      // is closed only if the worker opened it.
 
       case "TAB_OPENED_SINCE": {
         // Asked by the executor after a click: did that click open a tab?
@@ -1118,7 +437,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       case "TAKEOVER_EVALUATE_JOB": {
-        // Before the agent opens a job: does it fit the candidate at all?
+        // Before the agent opens a job: may it apply at all, and does this job
+        // fit the candidate?
         const profile = await getProfile();
         if (!profile?._validation?.ok) {
           return sendResponse({
@@ -1126,6 +446,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             error: "Complete and save a valid candidate profile first: the agent only applies to jobs that match it.",
           });
         }
+
+        // The governor is what stands between "useful" and "account
+        // restricted", and this is the only gate every application passes
+        // through. Pressing "Take over" is the user's own go-ahead, so the
+        // master switch is not consulted here — the caps and the breaker are.
+        const gate = await canSubmit({ requireEnabled: false });
+        if (!gate.ok && gate.reason !== "pacing") {
+          await info("Run held by the governor", { reason: gate.reason });
+          return sendResponse({ ok: true, decision: "STOP", reason: gate.reason });
+        }
+
         const settings = await getSettings();
         const job = jobFromCard(msg.job || {});
         // The model is consulted only for jobs the heuristic finds uncertain.
@@ -1192,7 +523,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       //
       // The content script cannot open, switch or close tabs. It asks here,
       // and this handler validates the request — in particular, a navigation
-      // URL must be http(s), so a `javascript:` URL can never be navigated to.
+      // URL must be http(s), so a `javascript:` URL can never be navigated to,
+      // and a page may only act on a tab it opened itself.
 
       case "AGENT_TAB_ACTION": {
         const tabId = sender?.tab?.id;
@@ -1208,27 +540,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             case "open_tab": {
               const url = safeHttpUrl(msg.url);
               if (!url) return sendResponse({ ok: false, error: "refused: only http(s) URLs may be opened" });
-              const created = await chrome.tabs.create({ url, active: true });
-              // The agent follows the application into the new tab.
-              await saveSession({ ...(await loadSession()), tabId: created.id, updatedAt: Date.now() });
+              if (!tabId) return sendResponse({ ok: false, error: "no originating tab" });
+              const created = await chrome.tabs.create({ url, active: true, openerTabId: tabId });
+              openedTabs.set(created.id, { id: created.id, openerTabId: tabId, createdAt: Date.now() });
               return sendResponse({ ok: true, tabId: created.id });
             }
             case "switch_tab": {
-              const session = await loadSession();
-              const target = msg.tabId || session.tabId;
-              if (!target) return sendResponse({ ok: false, error: "no tab to switch to" });
-              await chrome.tabs.update(target, { active: true });
-              return sendResponse({ ok: true, tabId: target });
+              const target = tabId && await childTab(tabId, msg.tabId);
+              if (!target) return sendResponse({ ok: false, error: "refused: this page did not open that tab" });
+              await chrome.tabs.update(target.id, { active: true });
+              return sendResponse({ ok: true, tabId: target.id });
             }
             case "close_tab": {
-              // Refuse to close the tab the run depends on; that would strand
-              // the session with no way back to the application.
-              const session = await loadSession();
-              if (tabId && tabId === session.tabId) {
-                return sendResponse({ ok: false, error: "refused: this is the active application tab" });
+              // The run lives in this page's own scripts, so closing this tab
+              // would end it. Only a tab this page opened may be closed.
+              const target = tabId && await childTab(tabId, msg.tabId);
+              if (!target) {
+                return sendResponse({ ok: false, error: "refused: only a tab this page opened may be closed" });
               }
-              if (!tabId) return sendResponse({ ok: false, error: "no originating tab" });
-              await chrome.tabs.remove(tabId);
+              await chrome.tabs.remove(target.id);
+              await chrome.tabs.update(tabId, { active: true }).catch(() => {});
               return sendResponse({ ok: true });
             }
             default:
@@ -1250,76 +581,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           confidence: hit.confidence,
           profileHint: profileHintForQuestion(msg.question),
         });
-      }
-
-      case "SCRAPE": {
-        // The application queue is candidate-specific. Do not turn a generic
-        // search page into a list of jobs that the profile already rules out.
-        const profile = await getProfile();
-        if (!profile?._validation?.ok) {
-          return sendResponse({
-            ok: false,
-            error: "Complete and save a valid candidate profile before searching for jobs.",
-          });
-        }
-        const tab = await chrome.tabs.create({ url: msg.url, active: false });
-        try {
-          await waitForTab(tab.id);
-          const platform = platformFromUrl(msg.url);
-          const r = await chrome.tabs.sendMessage(tab.id, { type: platform.scrapeMessage });
-          if (!r || !r.ok) throw new Error((r && r.error) || "scrape failed");
-          // Migration for earlier versions: skipped jobs were stored in queue.
-          // Remove them so a later profile correction permits a fresh search.
-          const queue = (await get("queue", [])).filter((job) => job.status !== "skipped");
-          const settings = await getSettings();
-          const unique = r.jobs.filter((job) => !duplicateOf(queue, job));
-          const evaluated = unique.map((job) => {
-            const ev = evaluateJob(job, profile, {
-              minRelevance: settings.governor.minRelevance,
-              preferences: settings.preferences,
-            });
-            return {
-              ...job,
-              // REVIEW is retained for the user but is never picked by the
-              // automatic runner; only APPLY candidates start as "ready".
-              status: ev.decision === "APPLY" ? "ready" : "review",
-              relevance: ev.relevance,
-              match_score: ev.match_score,
-              evaluation: ev,
-              reasons: ev.reasons,
-            };
-          });
-          const filtered = evaluated.filter((job) => job.evaluation.decision === "SKIP");
-          let added = evaluated.filter((job) => job.evaluation.decision !== "SKIP");
-          if (profile) {
-            const short = added.filter((j) => j.status === "ready" && j.relevance >= 0.35);
-            if (short.length) {
-              const ranked = await modelRerank(short, profile, askJSON);
-              const byId = new Map(ranked.map((j) => [j.id, j]));
-              added = added.map((j) => byId.get(j.id) || j);
-            }
-          }
-          added.sort((a, b) => (b.relevance || 0) - (a.relevance || 0));
-          await set("queue", queue.concat(added));
-          const review = added.filter((job) => job.status === "review").length;
-          await info("Jobs filtered for candidate", {
-            seen: r.jobs.length,
-            duplicate: r.jobs.length - unique.length,
-            filtered: filtered.length,
-            added: added.length,
-            review,
-          });
-          return sendResponse({
-            ok: true,
-            added: added.length,
-            review,
-            filtered: filtered.length,
-            duplicate: r.jobs.length - unique.length,
-            seen: r.jobs.length,
-          });
-        } finally {
-          await chrome.tabs.remove(tab.id).catch(() => {});
-        }
       }
 
       case "UPLOAD_RESUME":  return sendResponse({ ok: true, ...(await storeResume(msg.file)) });

@@ -144,8 +144,51 @@
     });
   }
 
+  const APPLIED_NAME = /^(?:applied|already applied|application submitted|application sent)\b/i;
+
+  function nameOf(el) {
+    return logic().accessibleName(core().describe(el));
+  }
+
+  /**
+   * The control that would have started this application, now reading
+   * "Applied" — a board's own record that it went through.
+   *
+   * A results list shows "Applied" on the jobs already done while still
+   * offering Apply on the rest, so a page that still offers an application
+   * never counts: the marker has to be the last word on the page.
+   */
+  function appliedControl() {
+    const controls = [...document.querySelectorAll("button, a, [role='button']")].filter(core().isVisible);
+    const applied = controls.find((el) => APPLIED_NAME.test(nameOf(el)));
+    if (!applied) return null;
+    // Any remaining way in counts, however plainly worded — "Apply" as much
+    // as "Easy Apply". Erring towards "not finished" costs a re-check; erring
+    // the other way records a job as applied to that never was.
+    const stillOffersApply = controls.some((el) =>
+      el !== applied && logic().rankApplyIntent(core().describe(el)) >= 0.5);
+    return stillOffersApply ? null : applied;
+  }
+
+  /** A marker inside an open application, where it can only be about this one. */
+  function appliedMarkerInApplication() {
+    const root = findApplicationRoot();
+    if (!root) return null;
+    return [...root.querySelectorAll("[class*='applied'], [class*='Applied']")]
+      .find(core().isVisible) || null;
+  }
+
+  /**
+   * Has this application been submitted?
+   *
+   * A false "applied" is the worst thing the agent can report — it records a
+   * job as done that was never sent — so each proof here is deliberately
+   * narrow: the page says so in words, or the apply control itself now says
+   * so, or a marker sits inside the open application.
+   */
   function isComplete() {
-    return logic().hasSubmissionEvidence(core().visibleBodyText(3000));
+    if (logic().hasSubmissionEvidence(core().visibleBodyText(3000))) return true;
+    return Boolean(appliedControl() || appliedMarkerInApplication());
   }
 
   globalThis.genericObserver = {

@@ -1,23 +1,11 @@
-// Tests for the platform registry.
+// Tests for the few board-specific facts the agent still needs.
 //
 // Run with: node --test tests/platforms.test.js
 
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { platformFromUrl, platformFromJob, isApplicationReceiptUrl } from "../src/lib/platforms.js";
-
-test("a URL is routed to the platform that owns its host", () => {
-  assert.equal(platformFromUrl("https://www.naukri.com/job-listings-python-1").id, "naukri");
-  assert.equal(platformFromUrl("https://www.linkedin.com/jobs/view/1").id, "linkedin");
-  assert.equal(platformFromUrl("https://acme.test/careers/1").id, "generic");
-  assert.equal(platformFromUrl("not a url").id, "generic");
-});
-
-test("a job's own site wins over its URL", () => {
-  assert.equal(platformFromJob({ site: "naukri", url: "https://acme.test/jobs/1" }).id, "naukri");
-  assert.equal(platformFromJob({ url: "https://www.linkedin.com/jobs/view/1" }).id, "linkedin");
-});
+import { isApplicationReceiptUrl } from "../src/lib/boards.js";
 
 // ---------------------------------------------------------------------------
 // Apply receipts
