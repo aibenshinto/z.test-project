@@ -82,9 +82,21 @@
     return globalThis.genericAgentLoop?.adapter || null;
   }
 
-  /** Is this page a search-results list rather than a single job? */
+  /** A URL that is a search rather than one job. */
+  const SEARCH_URL = /(?:\/search\b|\bjobs?-in-|[?&](?:q|query|keyword|keywords|what|searchTerm)=)/i;
+
+  /**
+   * Is this page a list of results, or one job?
+   *
+   * Counting job links is not enough: a job's own page carries a rail of
+   * other jobs ("similar jobs", "people also viewed"), and walking that rail
+   * means applying to everything except the job the user opened. So a page
+   * that is itself a job is a job, however many others it links to.
+   */
   function onResultsPage() {
-    return walker().findJobs().length >= 2;
+    if (walker().findJobs().length < 2) return false;
+    if (SEARCH_URL.test(location.href)) return true;
+    return !walker().looksLikeJobLink(location.href);
   }
 
   // -------------------------------------------------------------------------
@@ -340,7 +352,7 @@
           const clickedAt = Date.now();
           const opened = await walker().openJob(
             job,
-            () => !onResultsPage() || applicationAvailable(),
+            () => jobIsOpen(job),
             { settleMax: TIMING.settleMax, openWaitMs: TIMING.openWaitMs },
           );
 
@@ -452,6 +464,32 @@
     return state !== "unknown";
   }
 
+  /**
+   * Is the job the agent just clicked the one now open?
+   *
+   * The boards the agent is used on most show the job in a pane beside the
+   * results, so the list never goes away and the URL may not change. "The
+   * page offers an application" is no help either: a results page full of
+   * Apply buttons offers one before anything is clicked, so every job would
+   * read as opened the instant it was clicked, and the agent would apply to
+   * whatever the pane happened to be showing. This asks the only question
+   * that distinguishes them — is *this* job what the page is showing now?
+   */
+  function jobIsOpen(job) {
+    if (walker().canonicalJobUrl(location.href) === job.id) return true;
+
+    const headings = [
+      document.title,
+      ...[...document.querySelectorAll("h1, h2, [role='heading']")]
+        .filter((el) => obs().isVisible(el)).slice(0, 8).map((el) => obs().innerText(el)),
+    ].join(" ");
+    if (titleMatch(job.title, headings) >= 0.6) return true;
+
+    // A page that stopped being a list has navigated somewhere — the job's
+    // own page, or the application itself.
+    return !onResultsPage() && applicationAvailable();
+  }
+
   function stripJob(job) {
     return { id: job.id, title: job.title, company: job.company, url: job.url };
   }
@@ -494,7 +532,7 @@
 
   globalThis.__autoApplyTakeover = {
     run, stop, pause, resume, isRunning, reset, configure,
-    applyToOpenJob, adapterForCurrentPage, onResultsPage, returnToResults,
+    applyToOpenJob, adapterForCurrentPage, onResultsPage, returnToResults, jobIsOpen,
   };
 
   // -------------------------------------------------------------------------

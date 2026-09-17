@@ -605,3 +605,113 @@ test("a careers page that does not list this job is skipped without clicking any
   assert.equal(result.submitted, false);
   assert.match(result.reason, /lists several jobs, but not "Python Developer"/);
 });
+
+// ---------------------------------------------------------------------------
+// Boards the agent has never seen
+// ---------------------------------------------------------------------------
+
+/** A results page whose job links follow `hrefFor`, as an unknown board would. */
+function listingPage(url, hrefFor, count = 5, titleFor = (i) => `Senior Python Developer ${i}`) {
+  const e = createEnvironment({ scripts: scriptsFor(new URL(url).hostname), url });
+  e.make("a", { href: "/about", text: "About us", rect: { x: 0, y: 0, width: 80, height: 20 } });
+  e.make("a", { href: "/engineering", text: "Engineering", rect: { x: 90, y: 0, width: 100, height: 20 } });
+
+  for (let i = 1; i <= count; i++) {
+    const card = e.make("div", { rect: { x: 0, y: i * 120, width: 800, height: 100 } });
+    e.make("a", {
+      href: hrefFor(i),
+      text: titleFor(i),
+      rect: { x: 10, y: i * 120, width: 320, height: 24 },
+    }, card);
+    e.make("span", { text: "Acme Corp", rect: { x: 10, y: i * 120 + 30, width: 200, height: 20 } }, card);
+  }
+  return e;
+}
+
+test("a board with URLs nobody listed is still read, by the shape its list repeats", () => {
+  // Greenhouse, Lever, Workday, Glassdoor and SmartRecruiters all missed the
+  // old list of known URL patterns. On those the walker found no jobs at all,
+  // and the run treated the whole search page as a single job.
+  const boards = [
+    ["https://boards.greenhouse.io/acme?t=1", (i) => `https://boards.greenhouse.io/acme/jobs/40123${i}`],
+    ["https://jobs.lever.co/acme", (i) => `https://jobs.lever.co/acme/2f1b8c44-1f0a-4a1e-9f1a-2b3c4d5e6f7${i}`],
+    ["https://acme.wd1.myworkdayjobs.com/careers", (i) => `https://acme.wd1.myworkdayjobs.com/careers/job/Bengaluru/Python-Dev_R-1234${i}`],
+    ["https://www.glassdoor.co.in/Job/index.htm", (i) => `https://www.glassdoor.co.in/partner/jobListing.htm?jobListingId=100912345${i}`],
+    ["https://jobs.smartrecruiters.com/Acme", (i) => `https://jobs.smartrecruiters.com/Acme/74399991234${i}-python-developer`],
+  ];
+
+  for (const [url, hrefFor] of boards) {
+    const jobs = listingPage(url, hrefFor).sandbox.__autoApplyResultsWalker.findJobs();
+    assert.equal(jobs.length, 5, `${url} should yield 5 jobs`);
+    assert.match(jobs[0].title, /Senior Python Developer/);
+  }
+});
+
+test("a menu of same-shaped links is not a list of jobs", () => {
+  // The guard on the above: a row of links sharing a URL shape is a menu or a
+  // breadcrumb. A list of results stacks down the page instead.
+  const e = createEnvironment({ scripts: scriptsFor("acme.test"), url: "https://acme.test/careers" });
+  for (let i = 1; i <= 5; i++) {
+    e.make("a", {
+      href: `https://acme.test/team/1234${i}`,
+      text: `Our team in city ${i}`,
+      rect: { x: i * 150, y: 0, width: 140, height: 24 },
+    });
+  }
+
+  assert.equal(e.sandbox.__autoApplyResultsWalker.findJobs().length, 0);
+});
+
+test("a job's own page is not a results list, however many other jobs it rails", () => {
+  // A job page carries "similar jobs". Walking that rail means applying to
+  // every job except the one the user opened.
+  const e = listingPage("https://in.indeed.com/viewjob?jk=abc123",
+    (i) => `https://in.indeed.com/viewjob?jk=other${i}`);
+
+  assert.ok(e.sandbox.__autoApplyResultsWalker.findJobs().length >= 3, "the rail is still readable");
+  assert.equal(e.sandbox.__autoApplyTakeover.onResultsPage(), false);
+});
+
+test("a search page is a results list even when its URL names one job", () => {
+  // A board that shows the detail in a pane puts the open job in the URL.
+  const e = listingPage("https://www.linkedin.com/jobs/search/?keywords=python&currentJobId=4012345678",
+    (i) => `https://www.linkedin.com/jobs/view/401234567${i}`);
+
+  assert.equal(e.sandbox.__autoApplyTakeover.onResultsPage(), true);
+});
+
+test("the next page is only reached when the results actually change", async () => {
+  // A pager that quietly does nothing, or a "Next" in a carousel, would
+  // otherwise have the run walk the same jobs over again.
+  const { e } = resultsPage("www.naukri.com", 3);
+  const next = e.make("button", { text: "Next", rect: { x: 400, y: 900, width: 80, height: 36 } });
+  next.addEventListener("click", () => {
+    // Acknowledge the click without changing the results.
+    e.make("div", { role: "status", text: "Loading", rect: { x: 0, y: 950, width: 100, height: 20 } });
+  });
+
+  assert.equal(await e.sandbox.__autoApplyResultsWalker.goToNextPage(), false);
+});
+
+test("on a board that shows the job in a pane, opening waits for that job", async () => {
+  // The list never goes away and the URL may not change, so "the page offers
+  // an application" would be true from the start — every job would read as
+  // opened the moment it was clicked, and the agent would apply to whatever
+  // the pane was showing before.
+  const titles = ["Python Developer", "Staff Data Engineer", "Android Lead", "QA Analyst", "Site Reliability Engineer"];
+  const e = listingPage("https://www.linkedin.com/jobs/search/?keywords=python",
+    (i) => `https://www.linkedin.com/jobs/view/401234567${i}`, 5, (i) => titles[i - 1]);
+  // A results page that already offers an application, as these boards do.
+  e.make("button", { text: "Easy Apply", rect: { x: 900, y: 100, width: 120, height: 40 } });
+
+  const walker = e.sandbox.__autoApplyResultsWalker;
+  const [first, second] = walker.findJobs();
+
+  // Nothing has been clicked: no job is open, whatever the page offers.
+  assert.equal(e.sandbox.__autoApplyTakeover.jobIsOpen(first), false);
+
+  // The pane now shows the second job. Only that job counts as open.
+  e.make("h1", { text: second.title, rect: { x: 900, y: 60, width: 400, height: 30 } });
+  assert.equal(e.sandbox.__autoApplyTakeover.jobIsOpen(second), true);
+  assert.equal(e.sandbox.__autoApplyTakeover.jobIsOpen(first), false);
+});

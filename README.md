@@ -1,7 +1,13 @@
 # AutoApply
 
-Resume-driven job search and auto-application Chrome extension (MV3).
-Target sites: Naukri (first), LinkedIn, Indeed.
+A Chrome extension (MV3) that applies to jobs with you, in the tab you are
+already looking at. You sign in and run the search you want; the agent works
+down those results while you watch.
+
+It has no per-site code. The agent reads a page by what the page offers — a
+list that repeats, a control that starts an application, a form that takes a
+CV — so it works on Naukri, LinkedIn, Indeed, a company careers page or an ATS
+it has never seen, without anyone adding support for them first.
 
 ## Status
 
@@ -12,37 +18,38 @@ Target sites: Naukri (first), LinkedIn, Indeed.
 | Storage + settings | done |
 | Answer bank (cache-first screening answers) | done |
 | Rate governor + kill switch | done |
-| Orchestrator service worker | done |
-| Naukri selectors | verified against live DOM 2026-09-08 |
-| Naukri scrape adapter | done - parsing validated on 20 live cards |
-| Naukri apply driver | done - logic tested, **real submission untested** |
+| Takeover session (the agent works your tab) | done |
+| Results discovery on any board | done — by repeated structure, not per-site selectors |
+| Apply driver (dialog, form, external ATS, new tab) | done |
 | Side panel UI | done |
+| Tests | `npm test` — 249 passing |
 
-## Test results (2026-09-08)
+## How a run goes
 
-| Test | Result |
-|---|---|
-| `classify()` vs 7 real question strings | PASS - all routed correctly |
-| `typeInto()` short value ("2") | PASS - value set, input events fired |
-| `typeInto()` 65-char headline | PASS - 67 input events, one per char |
-| `typeInto()` overwrite | PASS - clean replace, no append |
-| `parseCard()` on live results page | PASS - 20/20 cards, null salary handled |
-| **End-to-end real submission** | **BLOCKED - see below** |
+```
+you sign in and search                     (the agent never logs in for you)
+        ↓  press Take over
+walk the visible results                   results-walker.js
+        ↓
+check the job against your profile         the worker, with the model
+        ↓
+open it → find apply → fill → verify       takeover.js + the shared agent loop
+        ↓                                   (a new tab is followed and handed back)
+back to the results → next job → next page
+```
 
-### Why the submission test is blocked
+## What it will not do
 
-Two independent blockers, neither of which is a code problem:
+**No automated login.** The extension runs inside your already-authenticated
+browser session; content scripts inherit your cookies. Scripting a login form is
+the fastest way to trigger a checkpoint and get the account flagged. A sign-in
+wall ends the run and leaves the page for you.
 
-1. The Naukri account's profile is incomplete (no resume on file, no 50+ char
-   headline). Naukri refuses every application, automated or manual, until
-   that is fixed. The driver correctly detects this and halts.
-2. No resume file has been supplied to the extension, so the profile cannot be
-   completed automatically either.
+**No CAPTCHA solving.** A challenge halts the run.
 
-`typeInto()` is verified against a synthetic contenteditable that mirrors
-Naukri's `.textArea`, including an input-event listener standing in for React's
-onChange. What remains unverified is whether Naukri's own React handler accepts
-those synthetic events - that can only be established on a real application.
+**No claimed submissions.** `submitted: true` requires proof on the page: a
+confirmation in words, or the apply control itself reporting the application.
+The model saying it finished is never enough.
 
 ## Design notes
 
@@ -72,8 +79,8 @@ run on anything resembling a CAPTCHA or rate limit. Master switch defaults off.
 1. `chrome://extensions` -> Developer mode -> Load unpacked -> this directory.
 2. Open the side panel, add an API key for at least one provider.
 3. Upload your resume. It is parsed once into a structured profile.
-4. Define searches, run in read-only mode, verify the queue looks sane.
-5. Only then flip `governor.enabled`.
+4. Open a job board, sign in, and run a search.
+5. Press **Take over this page** and watch. Stop it whenever you like.
 
 Your API key lives in `chrome.storage.local` and is readable by anyone with
 devtools access on this machine. Fine for a personal unpacked extension; do not

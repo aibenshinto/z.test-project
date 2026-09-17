@@ -514,3 +514,70 @@ scripts against a small DOM harness in `tests/helpers/`, no jsdom dependency).
 script list, so a load-order or missing-file regression fails the suite.
 `tests/interaction-core.test.js` asserts the classic-script bridge and the ES
 module agree, so the two copies of the verdict logic cannot drift.
+
+### One agent for every board increment (2026-09-17)
+
+The extension used to read a page by asking which site it was on: a Naukri
+bundle, a LinkedIn bundle, and a generic adapter for everything else. Both
+bundles are gone, along with the background queue that needed them.
+
+```
+                       before                          now
+page arrives    which site is this?              what does this page offer?
+                 ├─ naukri/  (8 files)
+                 ├─ linkedin/ (7 files)
+                 └─ generic/                     generic/  — every site
+run model       queue (2 boards) + takeover      takeover
+```
+
+**Why the bundles had to go.** Every new board meant another bundle, and the
+board a user wanted was always the one without one. Worse, the fallback was
+never really exercised: the two boards with bundles were the two that got
+tested, so the path every *other* site takes was the least trusted code in the
+repo. Now it is the only code, and the whole suite exercises it.
+
+**What was kept from them.** Two things the bundles alone could do are now
+shared heuristics, because losing them would have cost correctness rather than
+coverage:
+
+- an apply control that now reads "Applied" is a board's own record that an
+  application went through. Guarded: a list showing "Applied" on other jobs
+  while still offering Apply anywhere is not this job being done.
+- a sign-in path (`/login`, `/checkpoint`, `/authwall`) or a visible auth-wall
+  panel is a login wall, not an application.
+
+**The queue went with them.** It read a stored list and applied in tabs the
+user never saw. It needed a per-site scraper and a per-site apply message, had
+neither for any other site, and its generic branch sent an `APPLY` message
+that no content script has ever listened for — so a queued job on any other
+board could only ever end in `status: "error"`. The rate governor moved to the
+check that now runs before every job opens; pressing "Take over" is the
+go-ahead its master switch used to give, so the caps and the breaker apply but
+the switch does not.
+
+**Discovery is structural.** The walker matched five known URL shapes.
+Greenhouse, Lever, Workday, Glassdoor, SmartRecruiters and Wellfound all
+missed them, and on those pages it found no jobs at all, `onResultsPage()`
+went false, and the run applied to `document.title` as a single job. It now
+falls back to the largest group of links that share a URL shape *and* stack
+down the page like a list — a menu of same-shaped links is a row, a results
+list is a column. Two guards came with it: a page that is itself a job is
+never a list however many others it rails, and the next page counts as reached
+only when the jobs themselves change.
+
+**Opening a job is verified against that job.** The boards used most show the
+job in a pane beside the results, so the list never goes away and the URL may
+not change; "the page offers an application" is true before anything is
+clicked. Opening now waits for *this* job — its URL, or its title in a
+heading.
+
+#### Behavioural facts added (do not regress)
+
+1. A board can answer one apply click with two tabs: the company's
+   application, and its own receipt page. The receipt is never the
+   application, and must not be adopted, applied on, or counted.
+2. A form is the application only if it takes a file or its own wording says
+   so. A careers page's contact form otherwise reads as one, and the agent
+   sends the company a message instead of applying.
+3. `all_frames` is still false, so an application inside an embedded ATS
+   iframe is invisible to the agent. This is the largest remaining gap.

@@ -21,18 +21,94 @@
   // Job-card discovery
   // -------------------------------------------------------------------------
 
-  // URL shapes that indicate "this link opens a specific job".
+  // URL shapes that say "this link opens one particular job". These are a
+  // fast path for the boards whose shapes are already known — never the whole
+  // answer, because the board a user wants is always the one nobody listed.
   const JOB_URL_PATTERNS = [
     /\/jobs?\/view\//i,          // linkedin.com/jobs/view/123
     /\/job-listings-/i,          // naukri.com/job-listings-title-company
     /\/jobs?\/[^/]+-\d{4,}/i,    // generic slug-with-id
+    /\/jobs?\/\d{3,}/i,          // greenhouse.io/acme/jobs/4012345
     /\/viewjob\b/i,              // indeed
-    /[?&](?:jk|jobId|job_id|currentJobId)=/i,
+    /[?&](?:jk|vjk|gh_jid|jobId|job_id|jobListingId|currentJobId|posting)=/i,
   ];
+
+  /** Query parameters that identify a job, rather than track a click. */
+  const JOB_ID_PARAM = /^(?:jk|vjk|gh_jid|jobId|job_id|jobListingId|currentJobId|posting|requisitionId)$/i;
+
+  /** How many same-shaped links make a list rather than a coincidence. */
+  const MIN_REPEATED = 3;
 
   function looksLikeJobLink(href) {
     if (!href) return false;
     return JOB_URL_PATTERNS.some((re) => re.test(href));
+  }
+
+  /**
+   * What kind of page a URL points at, with the parts that identify one
+   * particular job blanked out. Two links of the same shape are two of the
+   * same kind of thing.
+   */
+  function urlShape(href) {
+    let url;
+    try { url = new URL(href, location.href); } catch (_) { return null; }
+    if (!/^https?:$/.test(url.protocol)) return null;
+
+    const path = url.pathname.split("/")
+      .map((segment) => (/\d{3,}/.test(segment) || /^[0-9a-f][0-9a-f-]{15,}$/i.test(segment) ? "#" : segment))
+      .join("/");
+    return `${url.host}${path}?${[...url.searchParams.keys()].sort().join(",")}`;
+  }
+
+  /** A link with a name of its own — not a chevron, an icon or a page number. */
+  function namesSomething(link) {
+    return obs().innerText(link).trim().length >= 6;
+  }
+
+  /**
+   * The largest group of links that point at the same kind of page, when
+   * those links stack up like a list.
+   *
+   * A board this agent has never seen still lists its jobs the way every
+   * other one does: one link per job, all the same shape, stacked down the
+   * page. That is a far better signal than a list of URL patterns, which can
+   * only ever cover the boards somebody thought of in advance — Greenhouse,
+   * Lever, Workday and Glassdoor all missed the old list, and on those the
+   * agent found no jobs at all and treated the whole search page as one job.
+   */
+  function repeatedJobLinks(links) {
+    const groups = new Map();
+    for (const link of links) {
+      const shape = urlShape(link.href || link.getAttribute("href"));
+      if (!shape || !namesSomething(link)) continue;
+      if (!groups.has(shape)) groups.set(shape, new Map());
+      const byJob = groups.get(shape);
+      const key = canonicalJobUrl(link.href || link.getAttribute("href"));
+      if (!byJob.has(key)) byJob.set(key, link);
+    }
+
+    let best = [];
+    for (const byJob of groups.values()) {
+      const group = [...byJob.values()];
+      if (group.length > best.length && stacksLikeAList(group)) best = group;
+    }
+    return best.length >= MIN_REPEATED ? best : [];
+  }
+
+  /**
+   * Do these links stack down the page, one per row?
+   *
+   * A row of links sharing a shape is a menu or a breadcrumb; a column of
+   * them is a list of results. This is the difference, and it holds whatever
+   * language the page is in.
+   */
+  function stacksLikeAList(links) {
+    const rows = new Set();
+    for (const link of links) {
+      const rect = obs().rectOf(cardFor(link));
+      if (rect.width > 0 || rect.height > 0) rows.add(Math.round(rect.y));
+    }
+    return rows.size >= MIN_REPEATED;
   }
 
   /**
@@ -67,9 +143,17 @@
       try { return opts.hint?.() || []; } catch (_) { return []; }
     })();
 
-    const links = hinted.length
-      ? hinted
-      : [...document.querySelectorAll("a[href]")].filter((a) => looksLikeJobLink(a.getAttribute("href")));
+    const visible = [...document.querySelectorAll("a[href]")].filter((a) => obs().isVisible(a));
+
+    // Shapes this agent already knows, or whatever this page repeats —
+    // whichever finds more. A page can carry one link of a known shape and a
+    // whole list of an unknown one.
+    let links = hinted;
+    if (!links.length) {
+      const known = visible.filter((a) => looksLikeJobLink(a.getAttribute("href")));
+      const repeated = repeatedJobLinks(visible);
+      links = repeated.length > known.length ? repeated : known;
+    }
 
     for (const link of links) {
       if (!obs().isVisible(link)) continue;
@@ -111,7 +195,7 @@
     try {
       const url = new URL(href, location.href);
       for (const param of [...url.searchParams.keys()]) {
-        if (!/^(?:jk|jobId|job_id|currentJobId)$/i.test(param)) url.searchParams.delete(param);
+        if (!JOB_ID_PARAM.test(param)) url.searchParams.delete(param);
       }
       url.hash = "";
       return url.href;
@@ -238,16 +322,32 @@
    * Advance to the next page of results, verifying the list actually changed.
    * @returns {Promise<boolean>}
    */
+  /** How long a page of results is given to replace the one before it. */
+  const NEW_RESULTS_MS = 6000;
+
   async function goToNextPage() {
     const next = findNextPage();
     if (!next) return false;
 
+    const before = new Set(findJobs().map((job) => job.id));
     const exec = globalThis.__autoApplyExecutorCore;
     const id = obs().registerElement(next, obs().describe(next));
     globalThis.__autoApplyCursor?.setNote("Next page of results");
 
     const result = await exec.click(id, { settleMax: 4000 });
-    return result.result === core().ACTION_RESULT.CONFIRMED;
+    if (result.result !== core().ACTION_RESULT.CONFIRMED) return false;
+
+    // A click the page acknowledged is not the same as a page of new results:
+    // a "Next" in a carousel acknowledges just as loudly, and a pager that
+    // quietly did nothing would otherwise have the run walk the same jobs
+    // again. The run moves on only when the jobs themselves change.
+    const deadline = Date.now() + NEW_RESULTS_MS;
+    for (;;) {
+      const now = findJobs().map((job) => job.id);
+      if (now.length && now.some((id) => !before.has(id))) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 200));
+    }
   }
 
   globalThis.__autoApplyResultsWalker = {
