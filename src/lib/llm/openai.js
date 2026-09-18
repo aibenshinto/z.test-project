@@ -1,5 +1,10 @@
 // OpenAI adapter. Same askJSON contract as claude.js.
 
+// Static imports only: ServiceWorkerGlobalScope forbids import(), so the
+// dynamic one this used to make on an error threw instead of reporting it.
+import { postJSON } from "./http.js";
+import { LLMError } from "./claude.js";
+
 const ENDPOINT = "https://api.openai.com/v1/chat/completions";
 
 export const defaults = {
@@ -17,28 +22,23 @@ export async function askJSON({ apiKey, model, system, user, schema, maxTokens, 
       ]
     : user;
 
-  const res = await fetch(ENDPOINT, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${apiKey}`,
+  const res = await postJSON(ENDPOINT, {
+    "content-type": "application/json",
+    authorization: `Bearer ${apiKey}`,
+  }, {
+    model: model || defaults.model,
+    max_tokens: maxTokens || defaults.maxTokens,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: userContent },
+    ],
+    response_format: {
+      type: "json_schema",
+      json_schema: { name: "response", strict: true, schema },
     },
-    body: JSON.stringify({
-      model: model || defaults.model,
-      max_tokens: maxTokens || defaults.maxTokens,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: userContent },
-      ],
-      response_format: {
-        type: "json_schema",
-        json_schema: { name: "response", strict: true, schema },
-      },
-    }),
   });
 
   if (!res.ok) {
-    const { LLMError } = await import("./claude.js");
     throw new LLMError(`openai ${res.status}`, res.status, await res.text());
   }
 

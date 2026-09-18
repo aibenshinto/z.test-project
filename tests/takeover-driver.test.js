@@ -194,6 +194,26 @@ test("each job opens in its own tab, is applied to there, and the tab is closed 
   assert.ok(log.focused.includes(1), "and brings the results back in front");
 });
 
+test("before every reading and every fit check, the panel is told what the agent is waiting on", async () => {
+  // Both wait on a model, often for many seconds. The panel used to go on
+  // showing "Agent has taken over this page" through all of it, and a run
+  // that was working looked crashed.
+  const { deps, log } = browser(newTabBoard());
+  const onScreen = () => log.reports.at(-1)?.phase;
+  const waitedOn = [];
+  const read = deps.read;
+  deps.read = async (...args) => { waitedOn.push(["read", onScreen()]); return read(...args); };
+  const evaluate = deps.evaluate;
+  deps.evaluate = async (job) => { waitedOn.push(["evaluate", onScreen()]); return evaluate(job); };
+
+  await runTakeover(deps, { tabId: 1 });
+
+  assert.ok(waitedOn.length > 3);
+  for (const [call, phase] of waitedOn) {
+    assert.equal(phase, call === "read" ? "read" : "check", `${call} ran with "${phase}" still on screen`);
+  }
+});
+
 test("the agent never looks for Apply on the results list when a job did not open", async () => {
   // The reported failure. The click on the job changed nothing, the page was
   // still the list — and the agent looked for Apply on the list, found

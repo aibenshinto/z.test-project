@@ -263,8 +263,12 @@ function fitReason(ev) {
 /**
  * Before the agent opens a job: may it apply at all, and does this job fit
  * the candidate? Returns { decision, reason } or { error }.
+ *
+ * @param {object} card
+ * @param {object} [opts]
+ * @param {Function} [opts.onRetry]  told when the model makes the check wait
  */
-async function evaluateTakeoverJob(card) {
+async function evaluateTakeoverJob(card, { onRetry } = {}) {
   const profile = await getProfile();
   if (!profile?._validation?.ok) {
     return { error: "Complete and save a valid candidate profile first: the agent only applies to jobs that match it." };
@@ -283,7 +287,8 @@ async function evaluateTakeoverJob(card) {
   const settings = await getSettings();
   const job = jobFromCard(card || {});
   // The model is consulted only for jobs the heuristic finds uncertain.
-  const ev = await evaluateJobWithModel(job, profile, askJSON, {
+  const ask = (req) => askJSON({ ...req, onRetry });
+  const ev = await evaluateJobWithModel(job, profile, ask, {
     minRelevance: settings.governor.minRelevance,
     preferences: settings.preferences,
   });
@@ -463,18 +468,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "TAKEOVER_START": {
         const tabId = Number(msg.tabId);
         if (!tabId) return sendResponse({ ok: false, error: "no tab to take over" });
+        if (takeoverStatus().running) return sendResponse({ ok: false, error: "a takeover run is already in progress" });
         const options = msg.options || {};
-        await info("Takeover started", { tabId, instruction: options.instruction || "" });
-        const summary = await startTakeover({
+        // Claimed before anything is awaited, so a second press cannot start
+        // a second run.
+        const run = startTakeover({
           tabId,
           instruction: options.instruction,
           maxJobs: options.maxJobs,
           maxPages: options.maxPages,
         }, takeoverServices);
+
+        // Answered now, not when the run ends. Holding the reply open made the
+        // whole run one event, and Chrome stops a worker that spends more
+        // than five minutes on a single event; a run of 25 jobs takes longer.
+        // The result goes to the panel as TAKEOVER_DONE.
+        sendResponse({ ok: true, started: true });
+        await info("Takeover started", { tabId, instruction: options.instruction || "" });
+
+        const summary = await run;
+        chrome.runtime.sendMessage({ type: "TAKEOVER_DONE", summary }).catch(() => {});
         await info("Takeover ended", {
           applied: summary.appliedCount, skipped: summary.skippedCount, reason: summary.reason || summary.error,
         });
-        return sendResponse(summary);
+        return;
       }
 
       case "TAKEOVER_STOP":   return sendResponse({ ok: stopTakeover() });

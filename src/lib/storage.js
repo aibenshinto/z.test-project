@@ -75,6 +75,8 @@ const USER_KEYS = [
   // Interaction diagnostics. `debugCaptures` holds page screenshots, so a
   // deletion request must clear these too.
   "clickDiagnostics", "debugCaptures", "debugMode",
+  // Every recorded application, with its title, company and address.
+  "applyTrace",
 ];
 
 /** User-initiated wipe of candidate data, history, keys, and session. */

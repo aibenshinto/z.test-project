@@ -2,6 +2,9 @@ import { getSettings, patchSettings } from "../lib/storage.js";
 import { encodeFile, storeResume, parseResume, getProfile, getResume,
          setProfile, validateProfile } from "../lib/resume.js";
 import { exportBank, remember } from "../lib/answer-bank.js";
+import { getLog } from "../lib/logger.js";
+import { buildDebugReport } from "../lib/debug-report.js";
+import { getDiagnostics } from "../lib/debug-store.js";
 
 const $ = (id) => document.getElementById(id);
 const log = (m) => { $("log").textContent = `${new Date().toLocaleTimeString()}  ${m}\n` + $("log").textContent; };
@@ -259,6 +262,58 @@ async function renderActivity() {
     `${e.extra?.reason ? ` — ${e.extra.reason}` : ""}`).join("\n");
 }
 
+/**
+ * Copy everything needed to see why a run went wrong: every recent event with
+ * all it recorded, the application trace, and the recent clicks.
+ */
+async function copyDebugLog() {
+  const [events, stored, settings, run, interactions] = await Promise.all([
+    getLog(200),
+    chrome.storage.local.get("applyTrace"),
+    getSettings(),
+    chrome.runtime.sendMessage({ type: "TAKEOVER_STATUS" }).catch(() => null),
+    getDiagnostics(50),
+  ]);
+  const report = buildDebugReport({
+    version: chrome.runtime.getManifest().version,
+    userAgent: navigator.userAgent,
+    routes: settings.llm.routes,
+    run,
+    panelStatus: $("takeoverStatus").textContent,
+    events,
+    trace: stored.applyTrace || [],
+    interactions,
+  });
+  await copyText(report);
+  return report.split("\n").length;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_) {
+    // The clipboard API can refuse a panel without focus; the old way still works.
+    const area = document.createElement("textarea");
+    area.value = text;
+    document.body.append(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    area.remove();
+    if (!ok) throw new Error("the browser refused to copy");
+  }
+}
+
+$("copyLog").onclick = async () => {
+  const status = $("copyLogStatus");
+  try {
+    const lines = await copyDebugLog();
+    status.textContent = `Copied ${lines} lines. Paste them where you need them.`;
+  } catch (err) {
+    status.textContent = `Could not copy: ${String(err?.message || err)}`;
+  }
+  setTimeout(() => { status.textContent = ""; }, 6000);
+};
+
 async function loadGov() {
   const { governor: g } = await getSettings();
   $("maxPerDay").value = g.maxPerDay; $("maxPerHour").value = g.maxPerHour;
@@ -364,8 +419,9 @@ if ($("takeoverStart")) {
       }).catch(() => {});
 
       // The run lives in the worker, so the page navigating — as Apply does
-      // on most job boards — does not end it.
-      const result = await chrome.runtime.sendMessage({
+      // on most job boards — does not end it. The worker answers as soon as
+      // the run starts; its result arrives as TAKEOVER_DONE.
+      const started = await chrome.runtime.sendMessage({
         type: "TAKEOVER_START",
         tabId: tab.id,
         options: {
@@ -374,23 +430,44 @@ if ($("takeoverStart")) {
           maxPages: Number($("maxPages").value) || 3,
         },
       });
-
-      if (!result?.ok) {
-        $("takeoverStatus").textContent = `Stopped: ${result?.error || "unknown error"}`;
-      } else {
-        const parts = [`${result.appliedCount} applied`, `${result.skippedCount} skipped`];
-        $("takeoverStatus").innerHTML =
-          `<b>${parts.join(", ")}</b><div>${esc(result.reason || "")}</div>` +
-          renderJobList(result.applied, "Applied") +
-          renderJobList(result.skipped, "Not submitted");
+      if (!started?.ok) {
+        $("takeoverStatus").textContent = `Stopped: ${started?.error || "unknown error"}`;
+        setTakeoverRunning(false);
       }
     } catch (err) {
-      $("takeoverStatus").textContent = `The run ended unexpectedly: ${String(err?.message || err)}`;
-    } finally {
+      $("takeoverStatus").textContent = `The run could not start: ${String(err?.message || err)}`;
       setTakeoverRunning(false);
-      renderDiagnostics();
     }
   };
+}
+
+function renderTakeoverResult(result) {
+  if (!result?.ok) {
+    $("takeoverStatus").textContent = `Stopped: ${result?.error || result?.reason || "unknown error"}`;
+  } else {
+    const parts = [`${result.appliedCount} applied`, `${result.skippedCount} skipped`];
+    $("takeoverStatus").innerHTML =
+      `<b>${parts.join(", ")}</b><div>${esc(result.reason || "")}</div>` +
+      renderJobList(result.applied, "Applied") +
+      renderJobList(result.skipped, "Not submitted");
+  }
+  setTakeoverRunning(false);
+  renderDiagnostics();
+}
+
+/**
+ * The panel shows a run as going until the worker says it ended. A worker
+ * Chrome stopped mid-run says nothing, so ask: without this the panel showed
+ * Pause and Stop, and the last step, for a run that no longer existed.
+ */
+async function checkTakeoverAlive() {
+  if ($("takeoverStop").hidden) return;
+  const status = await chrome.runtime.sendMessage({ type: "TAKEOVER_STATUS" }).catch(() => null);
+  if (status?.running || $("takeoverStop").hidden) return;
+  $("takeoverStatus").textContent =
+    "The run stopped without finishing: the extension's background worker was restarted. " +
+    "The activity log below shows its last steps.";
+  setTakeoverRunning(false);
 }
 
 function renderJobList(jobs, heading) {
@@ -422,8 +499,9 @@ if ($("showCursor")) {
   };
 }
 
-// Live progress from the agent as it works.
+// Live progress from the agent as it works, and its result when it ends.
 chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === "TAKEOVER_DONE") return renderTakeoverResult(msg.summary);
   if (msg?.type !== "TAKEOVER_PROGRESS") return;
   const box = $("takeoverStatus");
   if (!box) return;
@@ -498,7 +576,7 @@ if ($("clearDiagnostics")) {
 
 loadSetup(); loadGov(); renderStatus(); renderActivity(); renderDiagnostics(); renderTakeoverContext();
 loadInstruction(); renderTakeoverRunning();
-setInterval(() => { renderStatus(); renderActivity(); }, 5000);
+setInterval(() => { renderStatus(); renderActivity(); checkTakeoverAlive(); }, 5000);
 
 // Keep the takeover context in step with whatever the user is looking at.
 chrome.tabs.onActivated.addListener(() => renderTakeoverContext());

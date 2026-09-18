@@ -82,6 +82,21 @@ function browserDeps(control, s) {
   const send = (tabId, msg) => chrome.tabs.sendMessage(tabId, msg, { frameId: 0 });
   const tabInfo = (tab) => ({ id: tab.id, url: tab.pendingUrl || tab.url || "" });
 
+  function report(event) {
+    chrome.runtime.sendMessage({ type: "TAKEOVER_PROGRESS", ...event }).catch(() => {});
+    if (event.tabId != null) {
+      send(event.tabId, { type: "CURSOR_NOTE", note: event.note || "" }).catch(() => {});
+    }
+  }
+
+  // A model call that has to wait — a rate limit, a busy provider — says so
+  // on screen, rather than leaving the last step there as if the run had died.
+  const waiting = (tabId) => (r) => report({
+    phase: "waiting",
+    tabId,
+    note: `The model is busy (${r.status}); trying again in ${Math.round(r.waitMs / 1000)} s`,
+  });
+
   return {
     async view(tabId) {
       try {
@@ -98,7 +113,8 @@ function browserDeps(control, s) {
       // is the one on screen: a tab can only be captured while it is shown.
       const tab = await chrome.tabs.get(tabId).catch(() => null);
       const screenshot = tab?.active ? await s.captureForModel(tab.windowId).catch(() => null) : null;
-      const reading = await readPage(view, ctx, s.askJSON, { screenshot });
+      const ask = (req) => s.askJSON({ ...req, onRetry: waiting(tabId) });
+      const reading = await readPage(view, ctx, ask, { screenshot });
       await s.info("Page read", {
         url: view.url,
         pageType: reading.pageType,
@@ -161,7 +177,7 @@ function browserDeps(control, s) {
       }
     },
 
-    evaluate: (job) => s.evaluateJob(job),
+    evaluate: (job) => s.evaluateJob(job, { onRetry: waiting(null) }),
 
     async openTab(fromTabId, url, { pointAt } = {}) {
       const safe = s.safeHttpUrl(url);
@@ -201,12 +217,7 @@ function browserDeps(control, s) {
 
     applyInFrame: (tabId, job, instruction) => s.applyInFrame(tabId, job, instruction),
 
-    report(event) {
-      chrome.runtime.sendMessage({ type: "TAKEOVER_PROGRESS", ...event }).catch(() => {});
-      if (event.tabId != null) {
-        send(event.tabId, { type: "CURSOR_NOTE", note: event.note || "" }).catch(() => {});
-      }
-    },
+    report,
 
     record: (entry) => s.recordApplied(entry),
 
