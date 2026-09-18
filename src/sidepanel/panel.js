@@ -315,9 +315,27 @@ async function renderTakeoverContext() {
   if (!probe?.ok) { box.textContent = "Could not read this page."; return; }
 
   const host = (() => { try { return new URL(probe.url).hostname; } catch (_) { return probe.url; } })();
-  box.innerHTML = probe.onResultsPage
-    ? `Ready on <b>${esc(host)}</b> — <b>${probe.jobCount}</b> job${probe.jobCount === 1 ? "" : "s"} visible.`
-    : `On <b>${esc(host)}</b>. No results list detected; the agent will apply to this single job.`;
+  box.innerHTML = `Ready on <b>${esc(host)}</b>. The agent reads the page when you take over, ` +
+    `and decides what to do from there.`;
+}
+
+const DEFAULT_INSTRUCTION = "Apply to the jobs on this page that match my profile.";
+
+/** The instruction box keeps what the user last wrote. */
+async function loadInstruction() {
+  const box = $("takeoverInstruction");
+  if (!box) return;
+  const { takeoverInstruction } = await chrome.storage.local.get("takeoverInstruction");
+  box.value = takeoverInstruction || DEFAULT_INSTRUCTION;
+}
+
+/** A run keeps going with the panel closed; reopening it shows the controls. */
+async function renderTakeoverRunning() {
+  const status = await chrome.runtime.sendMessage({ type: "TAKEOVER_STATUS" }).catch(() => null);
+  if (!status?.running) return;
+  setTakeoverRunning(true);
+  if (status.paused) { $("takeoverPause").hidden = true; $("takeoverResume").hidden = false; }
+  $("takeoverStatus").textContent = "The agent is working…";
 }
 
 function setTakeoverRunning(running) {
@@ -332,6 +350,9 @@ if ($("takeoverStart")) {
     const tab = await activeTab();
     if (!tab?.id) return log("no active tab");
 
+    const instruction = ($("takeoverInstruction").value || "").trim() || DEFAULT_INSTRUCTION;
+    await chrome.storage.local.set({ takeoverInstruction: instruction });
+
     setTakeoverRunning(true);
     $("takeoverStatus").textContent = "Agent has taken over the page…";
     log(`agent taking over: ${tab.title || tab.url}`);
@@ -342,9 +363,13 @@ if ($("takeoverStart")) {
         visible: $("showCursor").checked,
       }).catch(() => {});
 
-      const result = await chrome.tabs.sendMessage(tab.id, {
+      // The run lives in the worker, so the page navigating — as Apply does
+      // on most job boards — does not end it.
+      const result = await chrome.runtime.sendMessage({
         type: "TAKEOVER_START",
+        tabId: tab.id,
         options: {
+          instruction,
           maxJobs: Number($("maxJobs").value) || 25,
           maxPages: Number($("maxPages").value) || 3,
         },
@@ -354,24 +379,13 @@ if ($("takeoverStart")) {
         $("takeoverStatus").textContent = `Stopped: ${result?.error || "unknown error"}`;
       } else {
         const parts = [`${result.appliedCount} applied`, `${result.skippedCount} skipped`];
-        if (result.reason) parts.push(esc(result.reason));
         $("takeoverStatus").innerHTML =
-          `<b>${parts.slice(0, 2).join(", ")}</b><div>${esc(result.reason || "")}</div>` +
+          `<b>${parts.join(", ")}</b><div>${esc(result.reason || "")}</div>` +
           renderJobList(result.applied, "Applied") +
           renderJobList(result.skipped, "Not submitted");
       }
     } catch (err) {
-      // The run lives in the page's own scripts, so the page leaving takes the
-      // run with it. A job board does exactly that when its apply control
-      // sends the tab to the company's site or to its own record of the click.
-      const message = String(err?.message || err);
-      const navigatedAway =
-        /message channel closed|Receiving end does not exist|context invalidated/i.test(message);
-      $("takeoverStatus").textContent = navigatedAway
-        ? "The page navigated away and the run stopped with it — a job board does this when " +
-          "Apply sends the tab elsewhere. Jobs already applied to are recorded. Go back to the " +
-          "results list and take over again to carry on."
-        : `The page stopped responding: ${message}. If it navigated away, reload and take over again.`;
+      $("takeoverStatus").textContent = `The run ended unexpectedly: ${String(err?.message || err)}`;
     } finally {
       setTakeoverRunning(false);
       renderDiagnostics();
@@ -391,9 +405,7 @@ for (const [id, type] of [["takeoverStop", "TAKEOVER_STOP"], ["takeoverPause", "
   const btn = $(id);
   if (!btn) continue;
   btn.onclick = async () => {
-    const tab = await activeTab();
-    if (!tab?.id) return;
-    await chrome.tabs.sendMessage(tab.id, { type }).catch(() => {});
+    await chrome.runtime.sendMessage({ type }).catch(() => {});
     if (type === "TAKEOVER_PAUSE") { $("takeoverPause").hidden = true; $("takeoverResume").hidden = false; }
     if (type === "TAKEOVER_RESUME") { $("takeoverPause").hidden = false; $("takeoverResume").hidden = true; }
     if (type === "TAKEOVER_STOP") { $("takeoverStatus").textContent = "Stopping after the current step…"; }
@@ -485,6 +497,7 @@ if ($("clearDiagnostics")) {
 }
 
 loadSetup(); loadGov(); renderStatus(); renderActivity(); renderDiagnostics(); renderTakeoverContext();
+loadInstruction(); renderTakeoverRunning();
 setInterval(() => { renderStatus(); renderActivity(); }, 5000);
 
 // Keep the takeover context in step with whatever the user is looking at.

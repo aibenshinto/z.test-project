@@ -67,7 +67,7 @@ export async function clearDiagnostics() {
 }
 
 /**
- * Capture the visible area of a tab as a PNG data URL.
+ * Capture the visible area of a tab as a data URL (PNG unless told otherwise).
  *
  * Returns null rather than throwing: a capture failure (tab not active, page
  * still loading, quota hit) must never break the agent run.
@@ -75,11 +75,11 @@ export async function clearDiagnostics() {
  * @param {number} [windowId]
  * @returns {Promise<string|null>}
  */
-export async function captureViewport(windowId) {
+export async function captureViewport(windowId, options = { format: "png" }) {
   try {
-    return await chrome.tabs.captureVisibleTab(windowId ?? chrome.windows.WINDOW_ID_CURRENT, {
-      format: "png",
-    });
+    // Needs the <all_urls> host permission (or activeTab): with narrower host
+    // access Chrome refuses every capture, and the model never sees the page.
+    return await chrome.tabs.captureVisibleTab(windowId ?? chrome.windows.WINDOW_ID_CURRENT, options);
   } catch (_) {
     return null;
   }
@@ -93,7 +93,9 @@ export async function captureViewport(windowId) {
  * @returns {Promise<{mime: string, b64: string}|null>}
  */
 export async function captureForModel(windowId) {
-  const dataUrl = await captureViewport(windowId);
+  // JPEG: a full-screen PNG is several times larger, and one is sent with
+  // every page the model reads.
+  const dataUrl = await captureViewport(windowId, { format: "jpeg", quality: 70 });
   if (!dataUrl) return null;
   const comma = dataUrl.indexOf(",");
   if (comma < 0) return null;

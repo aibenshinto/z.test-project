@@ -6,17 +6,14 @@
 // page, or a third-party ATS.
 //
 // Lifecycle:
-//   the takeover drives this loop directly; it answers no messages of its own
+//   the takeover's FILL_APPLICATION runs this loop; it answers no messages of
+//   its own
 //
 // `submitted: true` requires an explicit submission confirmation on the page.
 // The model saying "finish" is never sufficient.
 
 (function () {
   if (globalThis.genericAgentLoop) return; // idempotent guard
-
-  const loop = () => globalThis.__autoApplyAgentLoopCore;
-  const logic = () => globalThis.__autoApplyInteractionCore;
-  const obs = () => globalThis.__autoApplyObserverCore;
 
   /** @type {import("../shared/agent-loop-core.js").PlatformAdapter} */
   const adapter = {
@@ -31,37 +28,5 @@
     checkAnomaly: () => null,
   };
 
-  /**
-   * Run the agent loop against the current company career site.
-   * @param {object} [opts]
-   * @returns {Promise<object>}
-   */
-  async function runAgentLoop(opts = {}) {
-    // If the page is a job posting rather than the form itself, open the
-    // application first — verifying that the site actually reacted.
-    const snapshot = adapter.observe();
-    if (snapshot.page.applicationState === "ready") {
-      const opened = await loop().openApplication({
-        snapshot,
-        opened: () => Boolean(globalThis.genericObserver.findApplicationRoot()),
-        settleMax: adapter.settleMax,
-      });
-      if (!opened.opened) {
-        return {
-          submitted: false,
-          applicationStatus: logic().APPLICATION_STATUS.NOT_SUBMITTED,
-          answered: [],
-          turns: 0,
-          waitingForUser: true,
-          question: opened.reason +
-            " Please start the application on this page, then continue.",
-          reason: opened.reason,
-        };
-      }
-    }
-
-    return loop().run(adapter, { maxTurns: opts.maxTurns ?? 40 });
-  }
-
-  globalThis.genericAgentLoop = { runAgentLoop, adapter };
+  globalThis.genericAgentLoop = { adapter };
 }());

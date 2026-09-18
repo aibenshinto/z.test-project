@@ -192,7 +192,6 @@ test("an apply control that ignores .click() is opened with real pointer events"
   // The reported failure: the agent says it clicked Apply and the board does
   // not progress.
   const e = board("https://www.linkedin.com/jobs/view/1");
-  e.sandbox.__autoApplyTakeover.configure({ settleMax: 200, openWaitMs: 400, applyBudgetMs: 1500 });
 
   const btn = e.make("button", { text: "Easy Apply", rect: { x: 500, y: 300, width: 120, height: 40 } });
   btn.click = () => { /* accepted by the DOM, ignored by the application */ };
@@ -202,28 +201,25 @@ test("an apply control that ignores .click() is opened with real pointer events"
     e.make("button", { text: "Submit application", rect: { width: 160, height: 36 } }, dialog);
   });
 
-  e.sandbox.chrome.runtime.sendMessage = async (msg) =>
-    msg.type === "AI_DECIDE_ACTION"
-      ? { ok: true, action: { action: "stop", reason: "end of test" } }
-      : { ok: true };
+  const view = e.sandbox.__autoApplyTakeover.pageView();
+  const target = view.elements.find((el) => el.text === "Easy Apply").id;
+  const result = await e.sandbox.__autoApplyTakeover.act({ action: "click", target }, { settleMax: 200 });
 
-  const result = await e.sandbox.__autoApplyTakeover.applyToOpenJob({ title: "Python Developer" });
-
+  assert.equal(result.result, "ACTION_CONFIRMED");
   assert.equal(e.sandbox.genericObserver.observe().page.applicationState, "applying",
     "the application dialog must have opened");
-  assert.equal(result.submitted, false, "opening the dialog is not submission");
 });
 
 test("an unresponsive apply control is reported, not claimed as success", async () => {
   const e = board("https://www.linkedin.com/jobs/view/1");
-  e.sandbox.__autoApplyTakeover.configure({ settleMax: 200, openWaitMs: 300, applyBudgetMs: 1200 });
   // A button nothing listens to at all.
   e.make("button", { text: "Easy Apply", rect: { x: 500, y: 300, width: 120, height: 40 } });
 
-  const result = await e.sandbox.__autoApplyTakeover.applyToOpenJob({ title: "Python Developer" });
+  const view = e.sandbox.__autoApplyTakeover.pageView();
+  const target = view.elements.find((el) => el.text === "Easy Apply").id;
+  const result = await e.sandbox.__autoApplyTakeover.act({ action: "click", target }, { settleMax: 150 });
 
-  assert.equal(result.submitted, false);
-  assert.match(result.reason, /did not open/i);
+  assert.notEqual(result.result, "ACTION_CONFIRMED");
 });
 
 // ---------------------------------------------------------------------------
@@ -304,7 +300,7 @@ test("every host the manifest covers loads a complete agent", () => {
     for (const core of [
       "__autoApplyInteractionCore", "__autoApplyObserverCore", "__autoApplyPointer",
       "__autoApplyExecutorCore", "__autoApplyAgentLoopCore", "__autoApplyDiagnostics",
-      "__autoApplyCursor", "__autoApplyResultsWalker", "__autoApplyTakeover",
+      "__autoApplyCursor", "__autoApplyTakeover",
     ]) {
       assert.ok(e.sandbox[core], `${core} must be present on ${hostname}`);
     }
@@ -319,7 +315,7 @@ test("the agent runs on an arbitrary company site, not only the job boards", () 
     url: "https://careers.acme.test/apply/42",
   });
   assert.ok(e.sandbox.__autoApplyTakeover, "takeover must be available on any https site");
-  assert.equal(e.sandbox.__autoApplyTakeover.adapterForCurrentPage().name, "generic");
+  assert.equal(e.sandbox.genericAgentLoop.adapter.name, "generic");
 });
 
 // ---------------------------------------------------------------------------

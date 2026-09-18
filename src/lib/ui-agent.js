@@ -366,6 +366,7 @@ export function compactSnapshot(snapshot) {
  * @param {string}   [opts.screenshot]   data: URL of the viewport, when the DOM
  *                                       alone was insufficient
  * @param {object}   [opts.lastFailure]  The action that produced no effect
+ * @param {string}   [opts.instruction]  What the user told the agent to do
  * @returns {Promise<object>} AgentAction
  */
 export async function decideAction(snapshot, profile, askJSON, opts = {}) {
@@ -391,6 +392,11 @@ export async function decideAction(snapshot, profile, askJSON, opts = {}) {
     "CandidateContext:",
     JSON.stringify(candidateContext, null, 2),
   ];
+
+  // What the user asked the agent to do, in their own words.
+  if (opts.instruction) {
+    parts.push("", "UserInstruction:", String(opts.instruction).slice(0, 1000));
+  }
 
   // Which job this application is for. A company careers page can list many
   // openings, each with its own Apply, and a form may ask for the position.

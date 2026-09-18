@@ -614,3 +614,50 @@ or a page and its frames would hand the job back and forth.
 The routing rule this needs is in the behavioural facts above, and is the part
 to be careful with: before it, an embedded ad could have answered the side
 panel's "take over this page" ahead of the page itself.
+
+### The model reads the page (2026-09-18)
+
+**What went wrong.** On a Naukri search the agent reported "No control that
+starts an application was found on this page", clicked a "Get Naukri Pro"
+promotion that took the tab away ("The page navigated away and the run stopped
+with it"), and recorded jobs as applied without opening them. One cause: to
+tell whether a clicked job had opened, the page checked whether the job's
+title words appeared in the tab title or headings. On a search page both are
+made of the search words — "Python Developer Jobs In Kochi", and every card
+title is an `<h2>` — so every job read as open the instant it was clicked,
+whether or not anything opened. The agent then looked for Apply on the
+results list itself. A second cause made it fatal: the run lived in the page,
+so any navigation ended it.
+
+**What changed.** Nothing decides by rule what a page is any more.
+
+| Piece | Role |
+|---|---|
+| `src/lib/page-agent.js` | Shows the model one page — address, headings, visible text, every interactive element with its link, and a screenshot — and validates its reading: `job_list` (with each job's element), `job_detail` (with the apply control, and whether it is the job being worked on), `application_form`, `application_submitted`, `login_required`, `blocked`, `loading`, `other` (with a step toward the instruction). Element ids the page did not show are dropped. |
+| `src/lib/takeover-driver.js` | The run, as a pure module with injected browser access. Reads every page before acting and acts only on the reading. |
+| `src/background/takeover-session.js` | The driver's browser access, the run's controls, and a keep-alive. The run lives in the worker, so a page that navigates no longer ends it. |
+| `src/content/shared/takeover.js` | Eyes and hands only: `PAGE_VIEW`, `PAGE_ACT`, `JOB_LINKS`, `FILL_APPLICATION`, `VERIFY_SUBMITTED`. |
+
+Removed: `results-walker.js` (job cards by repeated link shape, "Next" by
+name), `jobIsOpen`, `onResultsPage`, `applyControlForJob`, `returnToResults`,
+and `openApplication` (the apply control is the one the model names).
+
+Kept in code, because they must not rest on a model's judgement: the security
+gate (checked before a page is shown to the model), the rate governor and fit
+check before each job, and proof of submission — a reading of
+`application_submitted` counts only if the page's own words or its apply
+control confirm it. A job the page says was already applied to is reported as
+such, not counted again.
+
+The side panel gains an instruction box ("What should the agent do?"); the
+instruction reaches every page reading and every form decision.
+
+`host_permissions` is now `<all_urls>`: `captureVisibleTab` needs it (or
+`activeTab`), and under `https://*/*` every screenshot failed silently, so the
+model never saw a page. Screenshots for the model are JPEG.
+
+**Known limits.** Clicks are synthetic, so a site that opens a job or an
+external application with `window.open` from a click handler may have it
+blocked as a pop-up; the driver falls back to opening the job's own link, but
+an external apply opened that way still depends on the site. Each page read is
+one model call with a screenshot.
