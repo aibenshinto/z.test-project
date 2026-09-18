@@ -336,6 +336,8 @@ test("a genuine confirmation banner is still recognised", () => {
     "We have received your application",
     "Application submitted successfully",
     "Your application is complete",
+    "You have successfully applied to Python Developer",
+    "Applied successfully",
   ]) {
     assert.equal(hasSubmissionEvidence(text), true, `"${text}" should prove submission`);
   }

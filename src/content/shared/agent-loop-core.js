@@ -158,13 +158,14 @@
    * `needVisual` asks the worker to attach a screenshot. Requested only when
    * the DOM alone was not enough (Part 23) — a normal turn stays text-only.
    */
-  async function decide(snapshot, { needVisual = false, lastFailure = null, job = null } = {}) {
+  async function decide(snapshot, { needVisual = false, lastFailure = null, job = null, instruction = "" } = {}) {
     const res = await chrome.runtime.sendMessage({
       type: "AI_DECIDE_ACTION",
       snapshot,
       needVisual,
       lastFailure,
       job,
+      instruction,
     });
     if (!res?.ok) {
       throw new Error("AI_DECIDE_ACTION failed: " + (res?.error || "no response"));
@@ -183,6 +184,7 @@
    * @param {object} [opts]
    * @param {number} [opts.maxTurns=30]
    * @param {object} [opts.job]  { title, company } of the job being applied for
+   * @param {string} [opts.instruction]  What the user told the agent to do
    * @returns {Promise<object>} { submitted, applicationStatus, answered, turns, ... }
    */
   async function run(adapter, opts = {}) {
@@ -279,7 +281,7 @@
       // 4. Decide
       let action;
       try {
-        action = await decide(snapshot, { needVisual, lastFailure, job: jobContext(opts.job) });
+        action = await decide(snapshot, { needVisual, lastFailure, job: jobContext(opts.job), instruction: opts.instruction || "" });
         needVisual = false;
         lastFailure = null;
       } catch (err) {
@@ -456,92 +458,5 @@
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Apply-button opening (Part 4 + Part 7)
-  // -------------------------------------------------------------------------
-
-  /**
-   * Find and click the control that starts an application, verifying that the
-   * site actually reacted.
-   *
-   * Used by the adapters in place of the old bare `button.click()`. Priority:
-   * platform selector hint → observed apply-intent ranking (Part 18).
-   *
-   * @param {object} params
-   * @param {() => Element|null} [params.hint]   Platform selector hint
-   * @param {object} params.snapshot             Current snapshot
-   * @param {() => boolean} params.opened        Did the application UI appear?
-   */
-  async function openApplication({ hint, snapshot, opened, settleMax = 3000, budgetMs = 20000, openWaitMs = 3000 }) {
-    const started = Date.now();
-    const candidates = [];
-
-    // 1. Platform hint, if it still finds something.
-    const hinted = (() => { try { return hint?.(); } catch (_) { return null; } })();
-    if (hinted) {
-      const meta = obs().describe(hinted);
-      const id = obs().registerElement(hinted, meta);
-      candidates.push({ id, name: core().accessibleName(meta), source: "platform_hint" });
-    }
-
-    // 2. Observed apply-intent candidates, ranked.
-    for (const cand of snapshot.applyCandidates || []) {
-      if (!candidates.some((c) => c.name === cand.name)) {
-        candidates.push({ ...cand, source: "observed" });
-      }
-    }
-
-    if (!candidates.length) {
-      return { opened: false, reason: "No control that starts an application was found on this page." };
-    }
-
-    let tried = 0;
-    for (const cand of candidates) {
-      // Each candidate costs a full click ladder plus a wait for the UI, so a
-      // page offering many apply-ish controls must not stall the run.
-      if (Date.now() - started > budgetMs) {
-        log(`[AGENT] Apply budget exhausted after ${tried} candidate(s)`);
-        break;
-      }
-
-      // A disabled control starts nothing — for example a bulk "Apply" that
-      // waits for jobs to be ticked — and clicking it can only fail.
-      if (obs().getMeta(cand.id)?.disabled) {
-        log(`[AGENT] Skipping disabled apply control ${cand.id} ("${cand.name}")`);
-        continue;
-      }
-      tried++;
-
-      log(`[AGENT] Trying apply control ${cand.id} ("${cand.name}") from ${cand.source}`);
-      const result = await exec().click(cand.id, { settleMax });
-
-      // The apply control opened the application in a new tab (typically the
-      // company's own site). The caller follows it there.
-      if (result.openedTab) {
-        log(`[AGENT] ${cand.id} opened the application in a new tab`);
-        return { opened: true, via: cand, clickResult: result, newTab: result.openedTab };
-      }
-
-      // The click may be CONFIRMED (page changed) while the change was not the
-      // dialog we wanted — so the authoritative test is `opened()`.
-      const deadline = Date.now() + openWaitMs;
-      while (Date.now() < deadline) {
-        if (opened()) {
-          log("[AGENT] Application UI opened");
-          return { opened: true, via: cand, clickResult: result };
-        }
-        await sleep(150);
-      }
-
-      log(`[AGENT] ${cand.id} did not open the application UI (${result.result})`);
-    }
-
-    return {
-      opened: false,
-      reason: "An apply control was clicked but the application UI did not open.",
-      tried: candidates.slice(0, tried).map((c) => c.name),
-    };
-  }
-
-  globalThis.__autoApplyAgentLoopCore = { run, openApplication, securityGate, assessSubmission, dispatch };
+  globalThis.__autoApplyAgentLoopCore = { run, securityGate, assessSubmission, dispatch };
 }());

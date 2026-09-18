@@ -1,13 +1,15 @@
 # AutoApply
 
 A Chrome extension (MV3) that applies to jobs with you, in the tab you are
-already looking at. You sign in and run the search you want; the agent works
-down those results while you watch.
+already looking at. You sign in, open a page — a job search, a company's
+careers page, a single job — write what you want done, and press Take over.
+The agent works while you watch.
 
-It has no per-site code. The agent reads a page by what the page offers — a
-list that repeats, a control that starts an application, a form that takes a
-CV — so it works on Naukri, LinkedIn, Indeed, a company careers page or an ATS
-it has never seen, without anyone adding support for them first.
+It has no per-site code and no rules for what a page is. Before every step the
+model is shown the page — its text, its interactive elements and a screenshot —
+and says what it is looking at: a list of jobs, one job, an application form,
+a confirmation, a sign-in wall. The agent acts on that reading, so it works on
+Naukri, LinkedIn, Indeed, a company careers page or an ATS it has never seen.
 
 ## Status
 
@@ -18,25 +20,28 @@ it has never seen, without anyone adding support for them first.
 | Storage + settings | done |
 | Answer bank (cache-first screening answers) | done |
 | Rate governor + kill switch | done |
-| Takeover session (the agent works your tab) | done |
-| Results discovery on any board | done — by repeated structure, not per-site selectors |
+| Takeover session (the agent works your tab) | done — the run lives in the worker, so page navigation does not end it |
+| Page reading (list / job / form / confirmation) | done — by the model, from the page's text, elements and a screenshot |
 | Apply driver (dialog, form, external ATS, new tab) | done |
 | Side panel UI | done |
 | Applications embedded in an ATS iframe | done — the worker drives the frame |
-| Tests | `npm test` — 265 passing |
+| Tests | `npm test` — 281 passing |
 
 ## How a run goes
 
 ```
-you sign in and search                     (the agent never logs in for you)
+you sign in, open a page, write an instruction   (the agent never logs in for you)
         ↓  press Take over
-walk the visible results                   results-walker.js
+read the page: list? job? form? other?           page-agent.js — the model decides
         ↓
-check the job against your profile         the worker, with the model
+list  → check each job against your profile      the worker, with the model
+      → open it (a new tab, or in place)
+job   → click the Apply the model pointed at
+form  → fill it                                  the shared agent loop
+done  → verify on the page itself                code, not the model
+other → one step toward the instruction          e.g. a Careers link
         ↓
-open it → find apply → fill → verify       takeover.js + the shared agent loop
-        ↓                                   (a new tab is followed and handed back)
-back to the results → next job → next page
+back to the results → next job → next page       takeover-driver.js, in the worker
 ```
 
 ## What it will not do
@@ -65,7 +70,8 @@ parsing to one model and screening questions to another. Raw `fetch` throughout 
 three SDKs would mean a bundler for no benefit.
 
 **Nothing lives in module scope.** The MV3 service worker is evicted after ~30s
-idle. All state is in `chrome.storage`; the run loop is driven by `chrome.alarms`.
+idle. All state is in `chrome.storage`. The one exception is a takeover in
+progress, which keeps the worker awake while it lasts.
 
 **Cache before you call.** ~90% of screening questions repeat across
 applications. `answer-bank.js` checks the cache first and only reaches an LLM on

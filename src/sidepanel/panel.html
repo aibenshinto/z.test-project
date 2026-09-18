@@ -177,9 +177,13 @@
 <section id="tab-run" hidden>
   <h3>Agent takeover</h3>
   <p class="meta">
-    Sign in and search for jobs yourself, then press Take over. The agent works
-    down the results in this tab while you watch — you can stop it at any time.
+    Open any page — a job search, a company's careers page, a single job — and
+    tell the agent what to do. It reads each page to decide whether it is a
+    list of jobs, a job, or an application, and acts in this tab while you
+    watch. You can stop it at any time.
   </p>
+  <label>What should the agent do?</label>
+  <textarea id="takeoverInstruction" rows="3"></textarea>
   <div id="takeoverContext" class="meta"></div>
   <div class="row" style="margin-top:6px;flex-wrap:wrap;gap:6px">
     <button class="act" id="takeoverStart">Take over this page</button>

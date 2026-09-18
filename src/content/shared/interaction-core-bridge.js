@@ -58,6 +58,8 @@
     /\bwe have received your application\b/i,
     /\byour application is complete\b/i,
     /\bsuccessfully submitted\b/i,
+    /\bsuccessfully applied\b/i,
+    /\bapplied successfully\b/i,
     /\bapplication submitted successfully\b/i,
     /\bapplication confirmation\b/i,
   ];

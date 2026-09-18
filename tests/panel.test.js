@@ -48,9 +48,9 @@ test("no control is left in the markup with nothing listening to it", () => {
 test("the panel only asks the worker for messages the worker answers", () => {
   const worker = read("src/background/service-worker.js");
   const answered = new Set([...worker.matchAll(/case "([A-Z_]+)":/g)].map((m) => m[1]));
-  // What the panel sends to the content script instead of the worker.
-  const toThePage = new Set(["TAKEOVER_START", "TAKEOVER_STOP", "TAKEOVER_PAUSE",
-    "TAKEOVER_RESUME", "TAKEOVER_PROBE", "SET_CURSOR_VISIBLE"]);
+  // What the panel sends to the content script instead of the worker. The
+  // run itself is the worker's, so it survives the page navigating.
+  const toThePage = new Set(["TAKEOVER_PROBE", "SET_CURSOR_VISIBLE"]);
 
   const sent = [...JS.matchAll(/type:\s*"([A-Z_]+)"/g)].map((m) => m[1]);
   const unanswered = [...new Set(sent)].filter((t) => !answered.has(t) && !toThePage.has(t)).sort();

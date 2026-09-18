@@ -12,6 +12,7 @@ const DEFAULTS = {
       rankJob:        { provider: "gemini", model: "gemini-flash-latest", maxTokens: 2048 },
       answerQuestion: { provider: "gemini", model: "gemini-flash-latest", maxTokens: 1024 },
       uiAction:       { provider: "gemini", model: "gemini-flash-latest", maxTokens: 2048 },
+      pageRead:       { provider: "gemini", model: "gemini-flash-latest", maxTokens: 4096 },
     },
   },
   profile: null,          // structured resume, produced once by parseResume
@@ -70,7 +71,7 @@ export const set = (key, value) => chrome.storage.local.set({ [key]: value });
 const USER_KEYS = [
   "llm", "profile", "resumeText", "resumeFile", "preferences", "answerBank",
   "queue", "eventLog", "submitLog", "agentSession", "haltedAt", "haltReason",
-  "confidence", "governor", "searches",
+  "confidence", "governor", "searches", "takeoverInstruction",
   // Interaction diagnostics. `debugCaptures` holds page screenshots, so a
   // deletion request must clear these too.
   "clickDiagnostics", "debugCaptures", "debugMode",

@@ -176,6 +176,16 @@ test("decideAction tells the model which job it is applying for", async () => {
   assert.match(prompt, /not this one, stop/);
 });
 
+test("decideAction tells the model what the user asked for", async () => {
+  let prompt = "";
+  const mockAskJSON = async ({ user }) => { prompt = user; return { action: "stop", reason: "test" }; };
+  const snapshot = { page: { applicationState: "applying" }, controls: [], questions: [], loading: false };
+
+  await decideAction(snapshot, {}, mockAskJSON, { instruction: "My notice period is 30 days" });
+
+  assert.match(prompt, /UserInstruction:\nMy notice period is 30 days/);
+});
+
 test("decideAction passes validated action from LLM through", async () => {
   const snapshot = {
     page: { applicationState: "questionnaire" },

@@ -1,21 +1,20 @@
 // Orchestrator.
 //
-// The agent runs in the tab the user is watching: they search, press "Take
-// over", and the content scripts work down that page. The worker is not a run
-// loop — it is the privileged half of that session. It does the things a
-// content script cannot: talk to a model, hold the API keys, read the profile
-// and resume, and see across tabs.
+// The agent runs in the tab the user is watching: they open a page, write
+// what they want done, and press "Take over". The run itself lives here, in
+// src/lib/takeover-driver.js by way of ./takeover-session.js, because a run
+// that lived in the page ended whenever the page navigated — and on a job
+// board, Apply navigating the tab is normal. The page's scripts are the
+// agent's eyes and hands; this worker is the part that decides, reads the
+// profile and resume, holds the API keys, and sees across tabs.
 //
-// There is no background queue and no hidden tab. An earlier version scraped a
-// search into a stored queue and applied in tabs the user never saw; it only
-// ever worked on two job boards, because a queue needs a per-site scraper and
-// a per-site apply message. Walking whatever results page the user is already
-// on needs neither, which is what makes the agent work on any job board.
+// What a page is — a list of jobs, one job, an application, a confirmation —
+// is never decided by a rule here. The model reads the page and says.
 //
 // The worker is evicted after ~30s idle, so nothing that must survive lives in
-// module scope. The one exception is the record of which tab opened which,
-// which is only meaningful while a run is in progress and messaging the worker
-// constantly.
+// module scope. The exceptions are the run in progress, which keeps the
+// worker awake while it lasts, and the record of which tab opened which, which
+// is only meaningful during a run.
 
 import { getSettings, deleteAllUserData } from "../lib/storage.js";
 import { canSubmit, recordSubmit, halt, clearHalt, stats } from "./governor.js";
@@ -28,6 +27,9 @@ import { isApplicationReceiptUrl } from "../lib/boards.js";
 import { pickApplicationFrame } from "../lib/frames.js";
 import { profileHintForQuestion } from "../lib/questions.js";
 import { decideAction } from "../lib/ui-agent.js";
+import {
+  startTakeover, stopTakeover, pauseTakeover, resumeTakeover, takeoverStatus,
+} from "./takeover-session.js";
 import {
   isDebugEnabled, setDebugEnabled, recordDiagnostic, getDiagnostics,
   clearDiagnostics, captureViewport, captureForModel, storeFailureCapture, getCaptures,
@@ -113,15 +115,6 @@ async function tabOpenedBy(openerTabId, since, waitMs = 0) {
 }
 
 /**
- * Close a job board's receipt page once it has loaded and recorded the click.
- * Failing to close it is not worth failing an application over.
- */
-async function closeReceiptTab(tabId) {
-  await waitForTab(tabId).catch(() => {});
-  await chrome.tabs.remove(tabId).catch(() => {});
-}
-
-/**
  * Only a tab that the asking page itself opened may be adopted or closed.
  * The record taken at creation counts too: Chrome can clear a tab's live
  * `openerTabId` once the user switches tabs.
@@ -145,89 +138,6 @@ function waitForTab(tabId, timeoutMs = 30000) {
     };
     poll();
   });
-}
-
-/**
- * Run the takeover application in `tabId` and return its outcome, following
- * the application across page loads.
- *
- * Apply on a job board often sends the same tab on to the company's own site.
- * That unloads the page mid-application and closes the message channel; the
- * new page has its own content scripts, so pick up again there.
- *
- * `depth` guards the one hand-off this makes for itself, from a board's
- * receipt page to the application the same click opened elsewhere.
- */
-async function applyInTab(tabId, job, depth = 0) {
-  // Multi-page ATS flows (Workday, Taleo) load a new page per step.
-  const MAX_PAGES = 10;
-  const startedAt = Date.now();
-  let lastError = null;
-  for (let page = 0; page < MAX_PAGES; page++) {
-    await waitForTab(tabId);
-
-    // The board sent this tab to its own record of the click. There is
-    // nothing to apply with here; the application is in the tab the same
-    // click opened.
-    const here = await chrome.tabs.get(tabId).catch(() => null);
-    if (here && isApplicationReceiptUrl(here.pendingUrl || here.url || "")) {
-      if (depth > 0) {
-        return { submitted: false, reason: "the job board recorded the apply click, but no application page opened" };
-      }
-      return followReceipt(tabId, job, startedAt);
-    }
-
-    // The shared scripts are declared for https://*/* so they are already
-    // present; this only covers a tab that loaded too early.
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["src/content/shared/takeover.js"],
-    }).catch(() => {});
-
-    try {
-      return await chrome.tabs.sendMessage(tabId, { type: "TAKEOVER_APPLY_HERE", job });
-    } catch (err) {
-      lastError = String(err?.message || err);
-      const tab = await chrome.tabs.get(tabId).catch(() => null);
-      if (!tab) throw new Error("the application tab was closed");
-      await info("Application moved to another page; following it", { url: tab.pendingUrl || tab.url });
-      // Let the next page start loading before waiting for it to finish.
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-  }
-  return { submitted: false, reason: `the application kept moving between pages (${lastError})` };
-}
-
-/**
- * This tab is showing a board's receipt for an apply click. Carry the
- * application on in the tab that same click opened, and close the receipt.
- *
- * The board has recorded the click by now, but that is not an application:
- * it still has to be completed on the company's own site.
- */
-async function followReceipt(tabId, job, since) {
-  const application = await tabOpenedBy(tabId, since, 3000);
-  if (!application || isApplicationReceiptUrl(application.pendingUrl || application.url || "")) {
-    return {
-      submitted: false,
-      reason: "the job board recorded the apply click, but did not open an application to fill in",
-    };
-  }
-
-  await info("The job board recorded the click; continuing in the company's own tab", {
-    url: application.pendingUrl || application.url,
-  });
-  await chrome.tabs.update(application.id, { active: true }).catch(() => {});
-  await closeReceiptTab(tabId);
-
-  const result = await applyInTab(application.id, job, 1);
-
-  // A challenge or a question for the user ends the run in the tab they need
-  // to act in, so that one stays open and in front.
-  if (!(result?.blocked || result?.stopped || result?.waitingForUser)) {
-    await chrome.tabs.remove(application.id).catch(() => {});
-  }
-  return result;
 }
 
 // ---- Applications inside an embedded frame ---------------------------------
@@ -273,6 +183,28 @@ async function applicationFrame(tabId) {
     .map((entry) => ({ frameId: entry.frameId, ...entry.result }));
 
   return pickApplicationFrame(probes);
+}
+
+/**
+ * Fill the application held in one of `tabId`'s frames, if one holds it.
+ * Returns null when no frame does, which is the usual case.
+ */
+async function applyInFrame(tabId, job, instruction) {
+  const frame = await applicationFrame(tabId);
+  if (!frame) return null;
+
+  await info("The application is in an embedded frame; continuing there", { url: frame.url });
+  try {
+    const result = await chrome.tabs.sendMessage(
+      tabId,
+      { type: "FILL_APPLICATION", job: job || null, instruction, force: true, toFrame: true },
+      { frameId: frame.frameId },
+    );
+    return result || { submitted: false, reason: "the embedded application did not report a result" };
+  } catch (err) {
+    // The frame navigated or was removed while it was being driven.
+    return { submitted: false, reason: `the embedded application stopped responding (${String(err?.message || err)})` };
+  }
 }
 
 /** Shape a results card, read as plain text, for the evaluator. */
@@ -328,6 +260,66 @@ function fitReason(ev) {
   return `${verdict} (${ev.match_score}% match)${why ? `: ${why}` : ""}`;
 }
 
+/**
+ * Before the agent opens a job: may it apply at all, and does this job fit
+ * the candidate? Returns { decision, reason } or { error }.
+ */
+async function evaluateTakeoverJob(card) {
+  const profile = await getProfile();
+  if (!profile?._validation?.ok) {
+    return { error: "Complete and save a valid candidate profile first: the agent only applies to jobs that match it." };
+  }
+
+  // The governor is what stands between "useful" and "account restricted",
+  // and every application passes through here. Pressing "Take over" is the
+  // user's own go-ahead, so the master switch is not consulted — the caps and
+  // the breaker are.
+  const gate = await canSubmit({ requireEnabled: false });
+  if (!gate.ok && gate.reason !== "pacing") {
+    await info("Run held by the governor", { reason: gate.reason });
+    return { decision: "STOP", reason: gate.reason };
+  }
+
+  const settings = await getSettings();
+  const job = jobFromCard(card || {});
+  // The model is consulted only for jobs the heuristic finds uncertain.
+  const ev = await evaluateJobWithModel(job, profile, askJSON, {
+    minRelevance: settings.governor.minRelevance,
+    preferences: settings.preferences,
+  });
+  await info("Takeover job evaluated", { title: job.title, decision: ev.decision, match_score: ev.match_score });
+  return { decision: ev.decision, match_score: ev.match_score, reason: fitReason(ev) };
+}
+
+/** Count a verified application against the governor's caps, and trace it. */
+async function recordApplied(entry) {
+  let site = "";
+  try { site = new URL(entry.url).hostname; } catch (_) { /* no address */ }
+  const payload = { ...entry, site };
+  const trace = { stage: "RECORD_SUBMIT_handler", payload };
+  console.log("[APPLY_TRACE]", JSON.stringify(trace));
+  await persistApplyTrace(trace);
+  await recordSubmit(payload);
+  const after = { stage: "stats_after_submit", stats: await stats() };
+  console.log("[APPLY_TRACE]", JSON.stringify(after));
+  await persistApplyTrace(after);
+}
+
+/** What a takeover run needs from the worker. */
+const takeoverServices = {
+  askJSON,
+  captureForModel,
+  evaluateJob: evaluateTakeoverJob,
+  recordApplied,
+  tabOpenedBy,
+  rememberOpenedTab: (tabId, openerTabId) =>
+    openedTabs.set(tabId, { id: tabId, openerTabId, createdAt: Date.now() }),
+  applyInFrame,
+  waitForTab,
+  safeHttpUrl,
+  info,
+};
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     switch (msg.type) {
@@ -335,17 +327,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       case "GET_STATUS":
         return sendResponse({ ok: true, stats: await stats(), log: await getLog(40) });
-
-      case "RECORD_SUBMIT": {
-        const traceRecSub = { stage: "RECORD_SUBMIT_handler", payload: msg.payload };
-        console.log("[APPLY_TRACE]", JSON.stringify(traceRecSub));
-        await persistApplyTrace(traceRecSub);
-        await recordSubmit(msg.payload);
-        const traceRecSubStats = { stage: "stats_after_submit", stats: await stats() };
-        console.log("[APPLY_TRACE]", JSON.stringify(traceRecSubStats));
-        await persistApplyTrace(traceRecSubStats);
-        return sendResponse({ ok: true });
-      }
 
       case "CLEAR_HALT":
         await clearHalt();
@@ -377,6 +358,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             screenshot,
             lastFailure: msg.lastFailure || null,
             job: msg.job || null,
+            instruction: msg.instruction || "",
           });
           return sendResponse({ ok: true, action, visual: Boolean(screenshot) });
         } catch (err) {
@@ -450,13 +432,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return sendResponse({ ok: true });
       }
 
-      // ---- Takeover: following a job into a new tab -----------------------
+      // ---- Tabs a click opened ---------------------------------------------
       //
-      // A job board often opens the company's own application in a NEW tab. A
-      // content script cannot see or drive another tab, so the takeover
-      // session asks the worker to run the application there and report back.
-      // The user watches it happen: the tab is focused, never hidden, and it
-      // is closed only if the worker opened it.
+      // A content script cannot see another tab, so it asks here whether its
+      // click opened one, and asks for a detour it did not want to be closed.
 
       case "TAB_OPENED_SINCE": {
         // Asked by the executor after a click: did that click open a tab?
@@ -466,78 +445,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return sendResponse(tab
           ? { ok: true, opened: true, tab: { id: tab.id, url: tab.pendingUrl || tab.url || "" } }
           : { ok: true, opened: false });
-      }
-
-      case "OPEN_TAB_FROM_PAGE": {
-        // A results page opening a job in a new tab. The worker does it,
-        // because Chrome blocks a page's scripted new-tab clicks as pop-ups.
-        const url = safeHttpUrl(msg.url);
-        const source = sender?.tab;
-        if (!url) return sendResponse({ ok: false, error: "refused: only http(s) URLs may be opened" });
-        if (!source?.id) return sendResponse({ ok: false, error: "no originating tab" });
-        const tab = await chrome.tabs.create({
-          url, active: true, openerTabId: source.id, index: source.index + 1,
-        });
-        openedTabs.set(tab.id, { id: tab.id, openerTabId: source.id, createdAt: Date.now() });
-        return sendResponse({ ok: true, tab: { id: tab.id, url } });
-      }
-
-      case "TAKEOVER_EVALUATE_JOB": {
-        // Before the agent opens a job: may it apply at all, and does this job
-        // fit the candidate?
-        const profile = await getProfile();
-        if (!profile?._validation?.ok) {
-          return sendResponse({
-            ok: false,
-            error: "Complete and save a valid candidate profile first: the agent only applies to jobs that match it.",
-          });
-        }
-
-        // The governor is what stands between "useful" and "account
-        // restricted", and this is the only gate every application passes
-        // through. Pressing "Take over" is the user's own go-ahead, so the
-        // master switch is not consulted here — the caps and the breaker are.
-        const gate = await canSubmit({ requireEnabled: false });
-        if (!gate.ok && gate.reason !== "pacing") {
-          await info("Run held by the governor", { reason: gate.reason });
-          return sendResponse({ ok: true, decision: "STOP", reason: gate.reason });
-        }
-
-        const settings = await getSettings();
-        const job = jobFromCard(msg.job || {});
-        // The model is consulted only for jobs the heuristic finds uncertain.
-        const ev = await evaluateJobWithModel(job, profile, askJSON, {
-          minRelevance: settings.governor.minRelevance,
-          preferences: settings.preferences,
-        });
-        await info("Takeover job evaluated", { title: job.title, decision: ev.decision, match_score: ev.match_score });
-        return sendResponse({ ok: true, decision: ev.decision, match_score: ev.match_score, reason: fitReason(ev) });
-      }
-
-      case "APPLY_IN_FRAME": {
-        // The page found no way to apply. Its application may be embedded in
-        // a frame, which only the worker can address.
-        const tabId = sender?.tab?.id;
-        if (!tabId) return sendResponse({ ok: false, error: "no originating tab" });
-
-        const frame = await applicationFrame(tabId);
-        if (!frame) return sendResponse({ ok: true, found: false });
-
-        await info("The application is in an embedded frame; continuing there", { url: frame.url });
-        try {
-          const result = await chrome.tabs.sendMessage(
-            tabId,
-            { type: "TAKEOVER_APPLY_HERE", job: msg.job || null, toFrame: true },
-            { frameId: frame.frameId },
-          );
-          return sendResponse({ ok: true, found: true, result });
-        } catch (err) {
-          // The frame navigated or was removed while it was being driven.
-          return sendResponse({ ok: true, found: true, result: {
-            submitted: false,
-            reason: `the embedded application stopped responding (${String(err?.message || err)})`,
-          } });
-        }
       }
 
       case "CLOSE_OPENED_TAB": {
@@ -551,45 +458,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return sendResponse({ ok: true });
       }
 
-      case "TAKEOVER_ADOPT_NEW_TAB": {
-        const sourceTabId = sender?.tab?.id;
-        if (!sourceTabId) return sendResponse({ ok: false, error: "no originating tab" });
+      // ---- The takeover run, controlled from the side panel ---------------
 
-        // The exact tab the click opened, or else one this page opened since
-        // the click. Never an older tab: the user may have opened jobs of
-        // their own from the same results page.
-        // One click can open two tabs, and the second can arrive a moment
-        // after the first, so wait rather than take whatever exists now:
-        // picking the board's receipt page over the application costs the
-        // whole job.
-        const adopted = msg.tabId != null
-          ? await childTab(sourceTabId, msg.tabId)
-          : msg.since != null
-            ? await tabOpenedBy(sourceTabId, Number(msg.since), 1500)
-            : null;
-
-        if (!adopted) return sendResponse({ ok: true, adopted: false });
-
-        try {
-          await chrome.tabs.update(adopted.id, { active: true });
-          const result = await applyInTab(adopted.id, msg.job || null);
-
-          // A challenge or a question for the user ends the run: leave that
-          // tab open and in front, where they can act on it.
-          if (result?.blocked || result?.stopped || result?.waitingForUser) {
-            return sendResponse({ ok: true, adopted: true, result });
-          }
-
-          // Return to the results so the run can continue.
-          await chrome.tabs.remove(adopted.id).catch(() => {});
-          await chrome.tabs.update(sourceTabId, { active: true }).catch(() => {});
-
-          return sendResponse({ ok: true, adopted: true, result });
-        } catch (err) {
-          await chrome.tabs.update(sourceTabId, { active: true }).catch(() => {});
-          return sendResponse({ ok: false, adopted: true, error: String(err?.message || err) });
-        }
+      case "TAKEOVER_START": {
+        const tabId = Number(msg.tabId);
+        if (!tabId) return sendResponse({ ok: false, error: "no tab to take over" });
+        const options = msg.options || {};
+        await info("Takeover started", { tabId, instruction: options.instruction || "" });
+        const summary = await startTakeover({
+          tabId,
+          instruction: options.instruction,
+          maxJobs: options.maxJobs,
+          maxPages: options.maxPages,
+        }, takeoverServices);
+        await info("Takeover ended", {
+          applied: summary.appliedCount, skipped: summary.skippedCount, reason: summary.reason || summary.error,
+        });
+        return sendResponse(summary);
       }
+
+      case "TAKEOVER_STOP":   return sendResponse({ ok: stopTakeover() });
+      case "TAKEOVER_PAUSE":  return sendResponse({ ok: pauseTakeover() });
+      case "TAKEOVER_RESUME": return sendResponse({ ok: resumeTakeover() });
+      case "TAKEOVER_STATUS": return sendResponse({ ok: true, ...takeoverStatus() });
 
       // ---- Tab-level actions requested by the agent -----------------------
       //

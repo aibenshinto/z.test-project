@@ -11,7 +11,7 @@
     "sidePanel"
   ],
   "host_permissions": [
-    "https://*/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "src/background/service-worker.js",
@@ -37,7 +37,6 @@
         "src/content/shared/diagnostics.js",
         "src/content/shared/executor-core.js",
         "src/content/shared/agent-loop-core.js",
-        "src/content/shared/results-walker.js",
         "src/content/generic/observer.js",
         "src/content/generic/executor.js",
         "src/content/generic/agent-loop.js",
