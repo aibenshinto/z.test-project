@@ -60,3 +60,17 @@ test("the panel only asks the worker for messages the worker answers", () => {
 function seenIn(ids, id) {
   return ids.includes(id);
 }
+
+test("the panel declares its encoding, so its dashes are not garbled", () => {
+  // Without it Chrome decoded the page in the system's legacy encoding on
+  // Windows, and every non-ASCII character in the markup came out garbled.
+  assert.match(HTML.slice(0, 1024), /<meta charset="utf-8">/i);
+});
+
+test("the panel takes a run's result from the message the worker sends when it ends", () => {
+  // The worker answers TAKEOVER_START as the run begins, so the result can
+  // only arrive this way; a panel that waited on the reply would never see it.
+  const worker = read("src/background/service-worker.js");
+  assert.match(worker, /type: "TAKEOVER_DONE"/);
+  assert.match(JS, /msg\?\.type === "TAKEOVER_DONE"/);
+});

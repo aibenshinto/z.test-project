@@ -154,6 +154,7 @@ export async function runTakeover(deps, opts = {}) {
         run.visited.add(job.key);
 
         // Only jobs that fit the candidate are opened at all.
+        report(run, tabId, { phase: "check", job: job.title, note: "Checking it against your profile" });
         const fit = await deps.evaluate(job);
         if (fit.error) return summarize(run, fit.error, { ok: false, error: fit.error });
         // The rate governor has had enough for now. The next job would be
@@ -371,6 +372,9 @@ async function look(run, tabId, ctx) {
     // Checked in code, before any model sees the page. Never bypassed.
     if (view.blocked) return { end: { submitted: false, blocked: true, stopped: true, reason: view.blocked } };
 
+    // A reading waits on the model, often for many seconds. Without this the
+    // panel went on showing the previous step, and the run looked dead.
+    report(run, tabId, { phase: "read", job: ctx.job?.title, note: "Reading the page" });
     let reading;
     try {
       reading = await deps.read(tabId, view, { instruction: run.instruction, job: ctx.job || null, lastStep: ctx.lastStep || "" });

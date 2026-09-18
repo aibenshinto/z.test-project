@@ -1,6 +1,8 @@
 // Anthropic adapter. Raw HTTP: no SDK, no bundler.
 // Called only from the service worker, where host_permissions removes CORS concerns.
 
+import { postJSON } from "./http.js";
+
 const ENDPOINT = "https://api.anthropic.com/v1/messages";
 const API_VERSION = "2023-06-01";
 
@@ -39,11 +41,7 @@ export async function askJSON({ apiKey, model, system, user, schema, maxTokens, 
   };
   body.fallbacks = "default";
 
-  const res = await fetch(ENDPOINT, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
+  const res = await postJSON(ENDPOINT, headers, body);
 
   if (!res.ok) {
     const detail = await res.text();
